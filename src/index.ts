@@ -945,29 +945,16 @@ class ZellijSessionProvider implements SessionProvider {
       port: assignedPort,
     });
 
-    // Spawn ttyd process.
-    // Zellij does not expose an "attach to session" command suitable for wrapping
-    // with ttyd in a non-interactive way. Instead we start ttyd with a shell in the
-    // session's working directory. The zellij session tracks the session lifecycle
-    // while ttyd provides the browser-accessible terminal.
-    const cwd = session.workingDirectory || process.env.HOME || "/";
-    const shell =
-      (session.metadata?.shell as string) || process.env.SHELL || "/bin/bash";
-
-    // Build the ttyd shell environment.
-    // Set zellij-identifying vars, and if the agent itself is running inside
-    // a different provider (e.g. tmux), remove that provider's vars so the
-    // ttyd shell correctly identifies as zellij-managed.
+    // Spawn ttyd with `zellij attach <session>` — this attaches to the actual
+    // zellij session, so the user gets the real zellij environment ($ZELLIJ is
+    // set by zellij itself). This mirrors how the tmux plugin uses
+    // `ttyd tmux attach -t <session>`.
+    //
+    // Build the ttyd environment: strip other providers' vars so the shell
+    // inside zellij doesn't inherit stale identifiers from the agent's env.
     const ttydEnv: Record<string, string | undefined> = { ...process.env };
-
-    // Set zellij identity
-    ttydEnv.ZELLIJ_SESSION_NAME = zellijSessionName;
     ttydEnv.VIBECONTROLS_PROVIDER = "zellij";
-    ttydEnv.TERM_PROGRAM = "zellij";
 
-    // If the agent is running inside another provider, clean those vars.
-    // Each provider registers the env vars that identify it; when spawning
-    // a session for a *different* provider we strip the inherited ones.
     const otherProviderVars: Record<string, string[]> = {
       tmux: ["TMUX", "TMUX_PANE", "TMUX_PLUGIN_MANAGER_PATH"],
       wezterm: ["WEZTERM_PANE", "WEZTERM_UNIX_SOCKET"],
@@ -989,13 +976,14 @@ class ZellijSessionProvider implements SessionProvider {
         "--writable",
         "--port",
         String(assignedPort),
-        shell,
+        "zellij",
+        "attach",
+        zellijSessionName,
       ],
       {
         stdout: "ignore",
         stderr: "ignore",
         stdin: "ignore",
-        cwd,
         env: ttydEnv as Record<string, string>,
       },
     );
