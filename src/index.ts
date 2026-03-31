@@ -10,7 +10,7 @@
  * Uses `script` command for headless Zellij session creation.
  */
 
-import type { Subprocess } from "bun";
+// No Subprocess import needed — we track PIDs only for restart resilience
 
 // ---------------------------------------------------------------------------
 // Types
@@ -153,7 +153,7 @@ interface VibePlugin {
     session?: SessionProvider;
   };
   onServerStart?(services: HostServices): Promise<void>;
-  onServerStop?(): Promise<void>;
+  onServerStop?(context?: { reason: "reload" | "shutdown" }): Promise<void>;
   onCliSetup?(): void;
 }
 
@@ -251,10 +251,7 @@ function zellijExecSilent(args: string[]): boolean {
  * Execute a `zellij -s <session> action <actionArgs>` command and return stdout.
  * Throws on non-zero exit.
  */
-function zellijActionExec(
-  sessionName: string,
-  actionArgs: string[],
-): string {
+function zellijActionExec(sessionName: string, actionArgs: string[]): string {
   return zellijExec(["-s", sessionName, "action", ...actionArgs]);
 }
 
@@ -477,8 +474,8 @@ class ZellijSessionProvider implements SessionProvider {
     };
   })();
 
-  /** In-memory map of ttyd child processes keyed by session ID. */
-  private ttydProcesses: Map<string, Subprocess> = new Map();
+  /** In-memory map of ttyd PIDs keyed by session ID. */
+  private ttydPids: Map<string, number> = new Map();
 
   /** In-memory map of ttyd port assignments keyed by session ID. */
   private ttydPorts: Map<string, number> = new Map();
@@ -521,15 +518,28 @@ class ZellijSessionProvider implements SessionProvider {
   /**
    * Graceful shutdown: stop all ttyd terminals.
    */
-  async shutdown(): Promise<void> {
-    this.log.info("ZellijSessionProvider shutting down — stopping terminals");
+  async shutdown(context?: { reason: "reload" | "shutdown" }): Promise<void> {
+    if (context?.reason === "reload") {
+      this.log.info(
+        "Hot-reload: preserving zellij sessions and ttyd processes",
+      );
+      await this.persistTerminals();
+      this.ttydPids.clear();
+      this.ttydPorts.clear();
+      return;
+    }
 
+    this.log.info("ZellijSessionProvider shutting down — stopping terminals");
     const stopPromises: Promise<void>[] = [];
-    for (const [sessionId] of this.ttydProcesses) {
+    for (const [sessionId] of this.ttydPids) {
       stopPromises.push(this.stopTerminal(sessionId));
     }
     await Promise.allSettled(stopPromises);
-
+    try {
+      await this.storage.delete(STORAGE_NAMESPACE, "terminals");
+    } catch {
+      /* ignore */
+    }
     this.log.info("ZellijSessionProvider shutdown complete");
   }
 
@@ -674,7 +684,7 @@ class ZellijSessionProvider implements SessionProvider {
     });
 
     // Stop terminal first if running
-    if (this.ttydProcesses.has(sessionId)) {
+    if (this.ttydPids.has(sessionId)) {
       await this.stopTerminal(sessionId);
     }
 
@@ -816,11 +826,7 @@ class ZellijSessionProvider implements SessionProvider {
     const tmpFile = `/tmp/vibe-zellij-capture-${sessionId}-${Date.now()}.txt`;
 
     try {
-      zellijActionExec(zellijSessionName, [
-        "dump-screen",
-        "--path",
-        tmpFile,
-      ]);
+      zellijActionExec(zellijSessionName, ["dump-screen", "--path", tmpFile]);
 
       // Read the dumped file
       const file = Bun.file(tmpFile);
@@ -996,8 +1002,9 @@ class ZellijSessionProvider implements SessionProvider {
     await sleep(500);
 
     // Store references
-    this.ttydProcesses.set(sessionId, child);
+    this.ttydPids.set(sessionId, child.pid);
     this.ttydPorts.set(sessionId, assignedPort);
+    await this.persistTerminals();
 
     const terminalInfo: TerminalInfo = {
       url: `http://localhost:${assignedPort}`,
@@ -1020,23 +1027,22 @@ class ZellijSessionProvider implements SessionProvider {
   }
 
   async stopTerminal(sessionId: string): Promise<void> {
-    const child = this.ttydProcesses.get(sessionId);
-    if (!child) {
+    const pid = this.ttydPids.get(sessionId);
+    if (!pid) {
       this.log.debug("No ttyd process found for session", { sessionId });
       return;
     }
 
     this.log.info("Stopping ttyd terminal", {
       sessionId,
-      pid: child.pid,
+      pid,
     });
 
-    if (child.pid) {
-      await gracefulKill(child.pid);
-    }
+    await gracefulKill(pid);
 
-    this.ttydProcesses.delete(sessionId);
+    this.ttydPids.delete(sessionId);
     this.ttydPorts.delete(sessionId);
+    await this.persistTerminals();
 
     // Clear terminal from session record
     const session = await this.getInfo(sessionId);
@@ -1078,11 +1084,11 @@ class ZellijSessionProvider implements SessionProvider {
   async listSystemTerminals(): Promise<SystemTerminalInfo[]> {
     const terminals: SystemTerminalInfo[] = [];
 
-    for (const [sessionId, child] of this.ttydProcesses) {
+    for (const [sessionId, pid] of this.ttydPids) {
       const port = this.ttydPorts.get(sessionId);
-      if (child.pid && port !== undefined) {
+      if (pid && port !== undefined) {
         terminals.push({
-          pid: child.pid,
+          pid,
           port,
           sessionId,
         });
@@ -1106,10 +1112,7 @@ class ZellijSessionProvider implements SessionProvider {
             if (!pid) continue;
 
             // Skip already-tracked processes
-            const alreadyTracked = [...this.ttydProcesses.values()].some(
-              (p) => p.pid === pid,
-            );
-            if (alreadyTracked) continue;
+            if ([...this.ttydPids.values()].includes(pid)) continue;
 
             // Try to extract port from command line
             const portIdx = parts.indexOf("--port");
@@ -1162,9 +1165,9 @@ class ZellijSessionProvider implements SessionProvider {
         killed++;
 
         // Remove from tracked processes if present
-        for (const [sessionId, child] of this.ttydProcesses) {
-          if (child.pid === pid) {
-            this.ttydProcesses.delete(sessionId);
+        for (const [sessionId, trackedPid] of this.ttydPids) {
+          if (trackedPid === pid) {
+            this.ttydPids.delete(sessionId);
             this.ttydPorts.delete(sessionId);
             break;
           }
@@ -1188,7 +1191,7 @@ class ZellijSessionProvider implements SessionProvider {
     let zellijOk: boolean;
     let zellijVersion: string;
     let sessionCount = 0;
-    const terminalCount = this.ttydProcesses.size;
+    const terminalCount = this.ttydPids.size;
 
     try {
       zellijVersion = zellijExec(["--version"]);
@@ -1254,7 +1257,7 @@ class ZellijSessionProvider implements SessionProvider {
 
       if (session.status === "terminated" || !exists) {
         // Stop terminal if somehow still running
-        if (this.ttydProcesses.has(session.id)) {
+        if (this.ttydPids.has(session.id)) {
           await this.stopTerminal(session.id);
         }
 
@@ -1333,9 +1336,9 @@ class ZellijSessionProvider implements SessionProvider {
   async killSystemTerminal(pid: number): Promise<void> {
     await gracefulKill(pid);
     // Remove from tracked processes if present
-    for (const [sessionId, child] of this.ttydProcesses) {
-      if (child.pid === pid) {
-        this.ttydProcesses.delete(sessionId);
+    for (const [sessionId, trackedPid] of this.ttydPids) {
+      if (trackedPid === pid) {
+        this.ttydPids.delete(sessionId);
         this.ttydPorts.delete(sessionId);
         break;
       }
@@ -1429,16 +1432,16 @@ class ZellijSessionProvider implements SessionProvider {
    * Get TerminalInfo for a session if ttyd is currently running.
    */
   private getRunningTerminalInfo(sessionId: string): TerminalInfo | null {
-    const child = this.ttydProcesses.get(sessionId);
+    const pid = this.ttydPids.get(sessionId);
     const port = this.ttydPorts.get(sessionId);
 
-    if (!child || !child.pid || port === undefined) {
+    if (!pid || port === undefined) {
       return null;
     }
 
     // Verify process is still alive
-    if (!isProcessAlive(child.pid)) {
-      this.ttydProcesses.delete(sessionId);
+    if (!isProcessAlive(pid)) {
+      this.ttydPids.delete(sessionId);
       this.ttydPorts.delete(sessionId);
       return null;
     }
@@ -1446,7 +1449,7 @@ class ZellijSessionProvider implements SessionProvider {
     return {
       url: `http://localhost:${port}`,
       port,
-      pid: child.pid,
+      pid,
     };
   }
 
@@ -1494,14 +1497,10 @@ class ZellijSessionProvider implements SessionProvider {
           version: result.stdout.toString("utf-8").trim(),
         });
       } else {
-        this.log.error(
-          "zellij auto-install completed but verification failed",
-        );
+        this.log.error("zellij auto-install completed but verification failed");
       }
     } catch {
-      this.log.error(
-        "zellij auto-install completed but binary is not in PATH",
-      );
+      this.log.error("zellij auto-install completed but binary is not in PATH");
     }
   }
 
@@ -1605,9 +1604,7 @@ class ZellijSessionProvider implements SessionProvider {
 
       this.log.warn("Homebrew install failed, falling back to direct download");
     } catch {
-      this.log.warn(
-        "Homebrew not available, falling back to direct download",
-      );
+      this.log.warn("Homebrew not available, falling back to direct download");
     }
 
     // Fallback: direct download (Apple Silicon by default, fallback to x86_64)
@@ -1765,12 +1762,44 @@ class ZellijSessionProvider implements SessionProvider {
     }
   }
 
+  private async persistTerminals(): Promise<void> {
+    const data: Record<string, { pid: number; port: number }> = {};
+    for (const [sessionId, pid] of this.ttydPids) {
+      const port = this.ttydPorts.get(sessionId);
+      if (port !== undefined) {
+        data[sessionId] = { pid, port };
+      }
+    }
+    try {
+      await this.storage.set(
+        STORAGE_NAMESPACE,
+        "terminals",
+        JSON.stringify(data),
+      );
+    } catch {
+      this.log.warn("Failed to persist terminal state");
+    }
+  }
+
+  private async loadPersistedTerminals(): Promise<
+    Record<string, { pid: number; port: number }>
+  > {
+    try {
+      const raw = await this.storage.get(STORAGE_NAMESPACE, "terminals");
+      if (!raw) return {};
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+
   /**
    * Reconcile persisted session records against actual zellij state.
-   * Marks sessions as inactive/terminated if their session is gone.
+   * Recovers ttyd processes from persisted data and adopts orphans.
    */
   private async reconcileSessions(): Promise<void> {
     const sessions = await this.loadSessions();
+    const persistedTerminals = await this.loadPersistedTerminals();
     let changed = false;
 
     for (const session of sessions) {
@@ -1779,21 +1808,132 @@ class ZellijSessionProvider implements SessionProvider {
       const zellijSessionName = this.getZellijSessionName(session);
       const exists = zellijSessionExists(zellijSessionName);
 
-      if (!exists && session.status === "active") {
-        session.status = "inactive";
-        session.updatedAt = nowISO();
-        session.terminal = undefined;
-        changed = true;
-        this.log.info("Reconciled stale session as inactive", {
-          id: session.id,
-          name: session.name,
-        });
+      if (!exists) {
+        // Zellij session is gone
+        if (session.status === "active") {
+          session.status = "inactive";
+          session.updatedAt = nowISO();
+          session.terminal = undefined;
+          changed = true;
+          this.log.info("Reconciled: zellij session gone, marking inactive", {
+            id: session.id,
+          });
+        }
+        // Kill orphaned ttyd for dead zellij session
+        const termData = persistedTerminals[session.id];
+        if (termData && isProcessAlive(termData.pid)) {
+          this.log.info("Killing orphaned ttyd for dead zellij session", {
+            sessionId: session.id,
+            pid: termData.pid,
+          });
+          await gracefulKill(termData.pid);
+        }
+        delete persistedTerminals[session.id];
+        continue;
       }
+
+      // Zellij session exists — try to recover ttyd
+      const termData = persistedTerminals[session.id];
+      if (termData) {
+        if (isProcessAlive(termData.pid)) {
+          // ttyd is still alive — re-adopt it
+          this.ttydPids.set(session.id, termData.pid);
+          this.ttydPorts.set(session.id, termData.port);
+          session.terminal = {
+            url: `http://localhost:${termData.port}`,
+            port: termData.port,
+            pid: termData.pid,
+          };
+          session.status = "active";
+          session.updatedAt = nowISO();
+          changed = true;
+          this.log.info("Recovered ttyd process", {
+            sessionId: session.id,
+            pid: termData.pid,
+            port: termData.port,
+          });
+        } else {
+          // ttyd died — clear stale data
+          session.terminal = undefined;
+          changed = true;
+          delete persistedTerminals[session.id];
+          this.log.info("Stale ttyd record cleared (process dead)", {
+            sessionId: session.id,
+          });
+        }
+      }
+
+      // Ensure active zellij sessions are marked active
+      if (exists && session.status !== "active") {
+        session.status = "active";
+        session.updatedAt = nowISO();
+        changed = true;
+      }
+    }
+
+    // Phase 2: Scan for orphaned ttyd processes not in persisted data
+    try {
+      const pgrepResult = Bun.spawnSync(["pgrep", "-a", "ttyd"], {
+        stdout: "pipe",
+        stderr: "pipe",
+        timeout: 5000,
+      });
+      const raw = pgrepResult.stdout.toString().trim();
+      if (raw) {
+        for (const line of raw.split("\n")) {
+          const parts = line.trim().split(/\s+/);
+          const pid = parseInt(parts[0] ?? "0", 10);
+          if (!pid) continue;
+
+          // Skip already-recovered processes
+          if ([...this.ttydPids.values()].includes(pid)) continue;
+
+          // Look for "zellij attach <session-name>" in the command line
+          const attachIdx = parts.indexOf("attach");
+          const zellijTarget = attachIdx !== -1 ? parts[attachIdx + 1] : null;
+          if (!zellijTarget) continue;
+
+          // Match to a known session
+          const matchedSession = sessions.find(
+            (s) =>
+              s.status !== "terminated" &&
+              this.getZellijSessionName(s) === zellijTarget,
+          );
+          if (!matchedSession) continue;
+
+          // Extract port from --port <N>
+          const portIdx = parts.indexOf("--port");
+          const port =
+            portIdx !== -1 ? parseInt(parts[portIdx + 1] ?? "0", 10) : 0;
+          if (!port) continue;
+
+          // Adopt the orphan
+          this.ttydPids.set(matchedSession.id, pid);
+          this.ttydPorts.set(matchedSession.id, port);
+          matchedSession.terminal = {
+            url: `http://localhost:${port}`,
+            port,
+            pid,
+          };
+          matchedSession.status = "active";
+          matchedSession.updatedAt = nowISO();
+          changed = true;
+          this.log.info("Adopted orphaned ttyd process", {
+            sessionId: matchedSession.id,
+            pid,
+            port,
+            zellijTarget,
+          });
+        }
+      }
+    } catch {
+      // pgrep not found or no ttyd processes — that's fine
     }
 
     if (changed) {
       await this.saveSessions(sessions);
     }
+    await this.persistTerminals();
   }
 }
 
@@ -1818,8 +1958,10 @@ const vibePlugin: VibePlugin = {
     await provider.init(services);
   },
 
-  async onServerStop(): Promise<void> {
-    await provider.shutdown();
+  async onServerStop(context?: {
+    reason: "reload" | "shutdown";
+  }): Promise<void> {
+    await provider.shutdown(context);
   },
 };
 
