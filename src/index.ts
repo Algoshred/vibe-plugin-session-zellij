@@ -114,6 +114,30 @@ interface SessionProvider {
   listSystem(): Promise<SystemSessionInfo[]>;
   killSystem(sessionId: string): Promise<void>;
   killSystemTerminal(pid: number): Promise<void>;
+
+  // Optional capability & extended capture methods
+  getCapabilities?(): SessionProviderCapabilities;
+  getScrollback?(sessionId: string, lines: number): Promise<string>;
+  searchOutput?(
+    sessionId: string,
+    pattern: string,
+  ): Promise<Array<{ line: number; content: string }>>;
+}
+
+interface SessionProviderCapabilities {
+  provider: string;
+  features: {
+    mouse: boolean;
+    resize: boolean;
+    capture: boolean;
+    webTerminal: boolean;
+    splitPanes: boolean;
+    tabs: boolean;
+    scrollback: boolean;
+    clipboard: boolean;
+    search: boolean;
+  };
+  platform: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1346,6 +1370,109 @@ class ZellijSessionProvider implements SessionProvider {
   }
 
   // -----------------------------------------------------------------------
+  // Capability & extended capture methods
+  // -----------------------------------------------------------------------
+
+  getCapabilities(): SessionProviderCapabilities {
+    return {
+      provider: "zellij",
+      features: {
+        mouse: true,
+        resize: true,
+        capture: true,
+        webTerminal: true,
+        splitPanes: true,
+        tabs: true,
+        scrollback: true,
+        clipboard: false,
+        search: true,
+      },
+      platform: ["linux", "macos"],
+    };
+  }
+
+  async getScrollback(sessionId: string, lines: number): Promise<string> {
+    const session = await this.requireSession(sessionId);
+    const zellijSessionName = this.getZellijSessionName(session);
+
+    this.log.debug("Getting scrollback", { sessionId, lines });
+
+    // Zellij dump-screen captures the visible terminal; for scrollback we use
+    // dump-screen with --full flag (captures full scrollback buffer)
+    const tmpFile = `/tmp/vibe-zellij-scrollback-${sessionId}-${Date.now()}.txt`;
+
+    try {
+      zellijActionExec(zellijSessionName, [
+        "dump-screen",
+        "--path",
+        tmpFile,
+        "--full",
+      ]);
+
+      const file = Bun.file(tmpFile);
+      const exists = await file.exists();
+      if (!exists) {
+        throw new Error("dump-screen did not create output file");
+      }
+
+      const output = await file.text();
+
+      // Clean up temp file
+      try {
+        const { unlinkSync } = await import("node:fs");
+        unlinkSync(tmpFile);
+      } catch {
+        // Ignore cleanup errors
+      }
+
+      // Return only the last N lines
+      const allLines = output.split("\n");
+      const sliced = allLines.slice(-lines);
+      return sliced.join("\n");
+    } catch (err) {
+      this.log.error("Failed to get scrollback", {
+        sessionId,
+        error: String(err),
+      });
+      throw new Error(
+        `Failed to get scrollback for session ${sessionId}: ${err}`,
+        { cause: err },
+      );
+    }
+  }
+
+  async searchOutput(
+    sessionId: string,
+    pattern: string,
+  ): Promise<Array<{ line: number; content: string }>> {
+    // Capture scrollback and search through it
+    const scrollback = await this.getScrollback(sessionId, 10000);
+    const lines = scrollback.split("\n");
+    const results: Array<{ line: number; content: string }> = [];
+
+    let regex: RegExp;
+    try {
+      regex = new RegExp(pattern);
+    } catch {
+      regex = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    }
+
+    for (let i = 0; i < lines.length; i++) {
+      if (regex.test(lines[i] ?? "")) {
+        results.push({ line: i + 1, content: lines[i] ?? "" });
+      }
+    }
+
+    this.log.debug("Search output completed", {
+      sessionId,
+      pattern,
+      matches: results.length,
+    });
+
+    return results;
+  }
+
+  // -----------------------------------------------------------------------
   // Private helpers — storage
   // -----------------------------------------------------------------------
 
@@ -1968,6 +2095,7 @@ const vibePlugin: VibePlugin = {
 export { vibePlugin };
 export type {
   SessionProvider,
+  SessionProviderCapabilities,
   SessionConfig,
   SessionInfo,
   SessionStatus,
