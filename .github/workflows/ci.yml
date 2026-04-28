@@ -39,6 +39,24 @@ jobs:
         with:
           bun-version-file: .bun-version
 
+      - name: Lockfile drift guard
+        run: |
+          set -euo pipefail
+          if [ ! -f package.json ] || [ ! -f bun.lock ]; then
+            echo "No package.json/bun.lock — skipping drift check"
+            exit 0
+          fi
+          tmp=$(mktemp -d)
+          cp package.json bun.lock "$tmp/"
+          [ -f bunfig.toml ] && cp bunfig.toml "$tmp/"
+          (cd "$tmp" && bun install --lockfile-only) >/dev/null 2>&1
+          if ! cmp -s "$tmp/bun.lock" bun.lock; then
+            echo "::error::bun.lock is out of sync with package.json — must be regenerated and committed"
+            echo "::error::Regen recipe: tmp=\$(mktemp -d) && cp package.json bunfig.toml bun.lock \"\$tmp/\" && (cd \"\$tmp\" && bun install --lockfile-only) && cp \"\$tmp/bun.lock\" bun.lock && git add bun.lock && git commit"
+            diff -u bun.lock "$tmp/bun.lock" | head -60 || true
+            exit 1
+          fi
+          echo "bun.lock in sync with package.json"
       - name: Install dependencies
         run: bun install
 
