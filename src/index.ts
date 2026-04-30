@@ -2071,7 +2071,7 @@ class ZellijSessionProvider implements SessionProvider {
 const provider = new ZellijSessionProvider();
 
 const vibePlugin: VibePlugin = {
-  name: "@burdenoff/vibe-plugin-session-zellij",
+  name: "session-zellij",
   version: "2.3.0",
   description:
     "Zellij + ttyd session provider — manages terminal sessions via Zellij and exposes web terminals via ttyd",
