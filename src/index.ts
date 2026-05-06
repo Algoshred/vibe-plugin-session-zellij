@@ -28,6 +28,8 @@ interface SessionConfig {
   shell?: string;
   size?: { cols: number; rows: number };
   projectId?: string;
+  /** Optional provider-native session name. */
+  externalName?: string;
 }
 
 interface SessionInfo {
@@ -122,6 +124,18 @@ interface SessionProvider {
     sessionId: string,
     pattern: string,
   ): Promise<Array<{ line: number; content: string }>>;
+
+  // Optional orphan discovery / adoption
+  discoverOrphans?(): Promise<OrphanSessionInfo[]>;
+  adopt?(externalName: string, displayName?: string): Promise<SessionInfo>;
+}
+
+interface OrphanSessionInfo {
+  externalName: string;
+  provider: string;
+  windows: number;
+  attached: boolean;
+  createdAt?: string;
 }
 
 interface SessionProviderCapabilities {
@@ -572,6 +586,22 @@ class ZellijSessionProvider implements SessionProvider {
   // -----------------------------------------------------------------------
 
   async create(config: SessionConfig): Promise<SessionInfo> {
+    // Attach-or-error on explicit externalName.
+    if (config.externalName) {
+      const target = config.externalName;
+      if (target.length === 0 || target.length > 128 || /[\0\r\n\s]/.test(target)) {
+        throw new Error(`Invalid externalName: ${target}`);
+      }
+      if (zellijSessionExists(target)) {
+        this.log.info("create(): attaching to existing zellij session", {
+          target,
+        });
+        return this.adopt(target, config.name);
+      }
+      throw new Error(
+        `No zellij session named "${target}" — drop externalName to create a new one`,
+      );
+    }
     const id = config.id || generateId();
     const zellijSessionName = `vibe-${id.substring(0, 8)}`;
     const now = nowISO();
@@ -1367,6 +1397,75 @@ class ZellijSessionProvider implements SessionProvider {
         break;
       }
     }
+  }
+
+  // -----------------------------------------------------------------------
+  // Orphan discovery & adoption
+  // -----------------------------------------------------------------------
+
+  async discoverOrphans(): Promise<OrphanSessionInfo[]> {
+    const known = new Set(
+      (await this.loadSessions())
+        .filter((s) => s.status !== "terminated")
+        .map((s) => this.getZellijSessionName(s)),
+    );
+    const sys = await this.listSystemSessions();
+    return sys
+      .filter((s) => s.name.startsWith("vibe-") && !known.has(s.name))
+      .map((s) => ({
+        externalName: s.name,
+        provider: "zellij",
+        windows: s.windows,
+        attached: s.attached,
+        createdAt: s.createdAt,
+      }));
+  }
+
+  async adopt(
+    externalName: string,
+    displayName?: string,
+  ): Promise<SessionInfo> {
+    if (!externalName.startsWith("vibe-")) {
+      throw new Error(
+        `Refusing to adopt zellij session "${externalName}" — only vibe-* sessions are adoptable`,
+      );
+    }
+    if (!zellijSessionExists(externalName)) {
+      throw new Error(`Zellij session "${externalName}" does not exist`);
+    }
+    const id = externalName.slice("vibe-".length) || externalName;
+    const existing = (await this.loadSessions()).find((s) => s.id === id);
+    if (existing) {
+      if (!this.ttydPids.has(id)) {
+        try {
+          await this.startTerminal(id);
+        } catch {
+          /* best-effort */
+        }
+      }
+      return (await this.get(id)) ?? existing;
+    }
+    const now = nowISO();
+    const info: SessionInfo = {
+      id,
+      name: displayName || externalName,
+      status: "active",
+      provider: this.name,
+      createdAt: now,
+      updatedAt: now,
+      metadata: {
+        zellijSessionName: externalName,
+        adopted: true,
+      },
+    };
+    await this.saveSession(info);
+    try {
+      info.terminal = await this.startTerminal(id);
+      await this.saveSession(info);
+    } catch {
+      /* best-effort */
+    }
+    return info;
   }
 
   // -----------------------------------------------------------------------
