@@ -11,6 +11,8 @@
  */
 
 // No Subprocess import needed — we track PIDs only for restart resilience
+import { tmpdir } from "node:os";
+import { join as joinPath } from "node:path";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -877,7 +879,10 @@ class ZellijSessionProvider implements SessionProvider {
     this.log.debug("Capturing output", { sessionId });
 
     // Use dump-screen to capture the visible terminal output to a temp file
-    const tmpFile = `/tmp/vibe-zellij-capture-${sessionId}-${Date.now()}.txt`;
+    const tmpFile = joinPath(
+      tmpdir(),
+      `vibe-zellij-capture-${sessionId}-${Date.now()}.txt`,
+    );
 
     try {
       zellijActionExec(zellijSessionName, ["dump-screen", "--path", tmpFile]);
@@ -1498,7 +1503,10 @@ class ZellijSessionProvider implements SessionProvider {
 
     // Zellij dump-screen captures the visible terminal; for scrollback we use
     // dump-screen with --full flag (captures full scrollback buffer)
-    const tmpFile = `/tmp/vibe-zellij-scrollback-${sessionId}-${Date.now()}.txt`;
+    const tmpFile = joinPath(
+      tmpdir(),
+      `vibe-zellij-scrollback-${sessionId}-${Date.now()}.txt`,
+    );
 
     try {
       zellijActionExec(zellijSessionName, [
@@ -1738,7 +1746,7 @@ class ZellijSessionProvider implements SessionProvider {
       "https://github.com/zellij-org/zellij/releases/latest/download/zellij-x86_64-unknown-linux-musl.tar.gz";
     const homeDir = process.env.HOME || "/root";
     const binDir = `${homeDir}/bin`;
-    const tarPath = `/tmp/zellij-install-${Date.now()}.tar.gz`;
+    const tarPath = joinPath(tmpdir(), `zellij-install-${Date.now()}.tar.gz`);
 
     try {
       // Ensure ~/bin exists
@@ -1838,7 +1846,7 @@ class ZellijSessionProvider implements SessionProvider {
     const url = `https://github.com/zellij-org/zellij/releases/latest/download/zellij-${arch}-apple-darwin.tar.gz`;
     const homeDir = process.env.HOME || "/Users/Shared";
     const binDir = `${homeDir}/bin`;
-    const tarPath = `/tmp/zellij-install-${Date.now()}.tar.gz`;
+    const tarPath = joinPath(tmpdir(), `zellij-install-${Date.now()}.tar.gz`);
 
     try {
       Bun.spawnSync(["mkdir", "-p", binDir], {
