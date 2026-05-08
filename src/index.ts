@@ -1285,16 +1285,10 @@ class ZellijSessionProvider implements SessionProvider {
       // Ignore — zero sessions
     }
 
-    // Check ttyd availability
+    // Check ttyd availability via Bun.which (handles PATHEXT on Windows).
     let ttydOk = false;
     try {
-      const whichCmd = isWindows() ? "where" : "which";
-      const whichResult = Bun.spawnSync([whichCmd, "ttyd"], {
-        stdout: "pipe",
-        stderr: "pipe",
-        timeout: 5000,
-      });
-      ttydOk = whichResult.exitCode === 0;
+      ttydOk = Bun.which("ttyd") !== null;
     } catch {
       // ttyd not found
     }
@@ -2208,6 +2202,11 @@ const vibePlugin: VibePlugin = {
   },
 
   async onServerStart(services: HostServices): Promise<void> {
+    if (process.platform === "win32") {
+      throw new Error(
+        "session-zellij is not supported on native Windows. Use WSL2.",
+      );
+    }
     services?.telemetry?.emit("session.provider.ready", { provider: "zellij" });
     await provider.init(services);
   },
