@@ -13,6 +13,21 @@
 // No Subprocess import needed — we track PIDs only for restart resilience
 import { tmpdir } from "node:os";
 import { join as joinPath } from "node:path";
+import type {
+  HostServices,
+  VibePlugin,
+} from "@vibecontrols/plugin-sdk/contract";
+import { createLifecycleHooks } from "@vibecontrols/plugin-sdk/lifecycle";
+import { TypedStore } from "@vibecontrols/plugin-sdk/storage";
+import {
+  findAvailablePort,
+  gracefulKill,
+  isProcessAlive,
+  sleep,
+} from "@vibecontrols/plugin-sdk/subprocess";
+import { BoundLogger } from "@vibecontrols/plugin-sdk/log";
+import { TelemetryEmitter } from "@vibecontrols/plugin-sdk/telemetry";
+import { ProviderRegistry } from "@vibecontrols/plugin-sdk/providers";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -157,70 +172,17 @@ interface SessionProviderCapabilities {
 }
 
 // ---------------------------------------------------------------------------
-// HostServices — provided by the vibe-agent runtime at plugin load
-// ---------------------------------------------------------------------------
-
-interface HostLogger {
-  info(message: string, meta?: Record<string, unknown>): void;
-  warn(message: string, meta?: Record<string, unknown>): void;
-  error(message: string, meta?: Record<string, unknown>): void;
-  debug(message: string, meta?: Record<string, unknown>): void;
-}
-
-interface HostStorage {
-  get(namespace: string, key: string): Promise<string | null>;
-  set(namespace: string, key: string, value: string): Promise<void>;
-  delete(namespace: string, key: string): Promise<boolean>;
-}
-
-interface HostServices {
-  telemetry?: {
-    emit: (name: string, payload?: Record<string, unknown>) => void;
-  };
-  logger: HostLogger;
-  storage: HostStorage;
-}
-
-// ---------------------------------------------------------------------------
-// VibePlugin interface
-// ---------------------------------------------------------------------------
-
-interface PluginCapabilities {
-  storage?: "none" | "read" | "rw";
-  secrets?: "none" | "read" | "rw";
-  gateway?: boolean;
-  broadcast?: boolean;
-  subprocess?: boolean;
-  audit?: boolean;
-  telemetry?: boolean;
-}
-
-interface VibePlugin {
-  capabilities?: PluginCapabilities;
-  name: string;
-  version: string;
-  description: string;
-  tags?: Array<
-    "backend" | "frontend" | "cli" | "provider" | "adapter" | "integration"
-  >;
-  providers: {
-    session?: SessionProvider;
-  };
-  onServerStart?(services: HostServices): Promise<void>;
-  onServerStop?(context?: { reason: "reload" | "shutdown" }): Promise<void>;
-  onCliSetup?(): void;
-}
-
-// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
+const PLUGIN_NAME = "session-zellij";
+const PLUGIN_VERSION = "2026.509.2";
 const PROVIDER_NAME = "session-zellij";
 const STORAGE_NAMESPACE = "session-zellij";
 const STORAGE_KEY_SESSIONS = "sessions";
+const STORAGE_KEY_TERMINALS = "terminals";
 const TTYD_BASE_PORT = 8081;
 const TTYD_PORT_RANGE = 200;
-const GRACEFUL_KILL_TIMEOUT_MS = 3000;
 
 // ---------------------------------------------------------------------------
 // Zellij session info parsed from `zellij list-sessions`
@@ -371,125 +333,6 @@ function listZellijSessions(): ZellijSessionListEntry[] {
 }
 
 /**
- * Find an available TCP port starting from `start` within the configured range.
- */
-async function findAvailablePort(start: number): Promise<number> {
-  for (let port = start; port < start + TTYD_PORT_RANGE; port++) {
-    const available = await isPortAvailable(port);
-    if (available) {
-      return port;
-    }
-  }
-  throw new Error(
-    `No available port found in range ${start}-${start + TTYD_PORT_RANGE - 1}`,
-  );
-}
-
-/**
- * Check whether a TCP port is available by attempting to bind to it.
- */
-function isPortAvailable(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    try {
-      const server = Bun.listen({
-        hostname: "127.0.0.1",
-        port,
-        socket: {
-          data() {},
-        },
-      });
-      server.stop(true);
-      resolve(true);
-    } catch {
-      resolve(false);
-    }
-  });
-}
-
-/**
- * Send SIGTERM to a process, then SIGKILL after timeout if still alive.
- * On Windows, uses taskkill.
- */
-async function gracefulKill(
-  pid: number,
-  timeout: number = GRACEFUL_KILL_TIMEOUT_MS,
-): Promise<void> {
-  if (isWindows()) {
-    // On Windows, use taskkill
-    try {
-      Bun.spawnSync(["taskkill", "/PID", String(pid), "/F"], {
-        stdout: "pipe",
-        stderr: "pipe",
-        timeout: 5000,
-      });
-    } catch {
-      // Process already dead
-    }
-    return;
-  }
-
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch {
-    // Process already dead — nothing to do
-    return;
-  }
-
-  const deadline = Date.now() + timeout;
-
-  while (Date.now() < deadline) {
-    await sleep(200);
-    if (!isProcessAlive(pid)) {
-      return;
-    }
-  }
-
-  // Force kill
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    // Already gone
-  }
-}
-
-/**
- * Check if a process is still alive.
- * On Windows, uses tasklist to check.
- */
-function isProcessAlive(pid: number): boolean {
-  if (isWindows()) {
-    try {
-      const result = Bun.spawnSync(
-        ["tasklist", "/FI", `PID eq ${pid}`, "/NH"],
-        {
-          stdout: "pipe",
-          stderr: "pipe",
-          timeout: 5000,
-        },
-      );
-      const output = result.stdout.toString();
-      return output.includes(String(pid));
-    } catch {
-      return false;
-    }
-  }
-
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Simple async sleep.
- */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
  * Get the current ISO timestamp.
  */
 function nowISO(): string {
@@ -500,33 +343,21 @@ function nowISO(): string {
 // ZellijSessionProvider
 // ---------------------------------------------------------------------------
 
+interface PersistedTerminal {
+  pid: number;
+  port: number;
+}
+
 class ZellijSessionProvider implements SessionProvider {
   readonly name = PROVIDER_NAME;
 
-  private services: HostServices | null = null;
+  /** Logger — bound to plugin source; no-op until init() supplies host logger. */
+  private log: BoundLogger = new BoundLogger(undefined, PLUGIN_NAME);
 
-  /** Logger with safe no-op fallback until init() is called. */
-  private log: HostLogger = {
-    info: () => {},
-    warn: () => {},
-    error: () => {},
-    debug: () => {},
-  };
-
-  /** Storage with safe in-memory fallback until init() is called. */
-  private storage: HostStorage = (() => {
-    const mem = new Map<string, string>();
-    return {
-      get: async (namespace: string, key: string) =>
-        mem.get(`${namespace}:${key}`) ?? null,
-      set: async (namespace: string, key: string, value: string) => {
-        mem.set(`${namespace}:${key}`, value);
-      },
-      delete: async (namespace: string, key: string) => {
-        return mem.delete(`${namespace}:${key}`);
-      },
-    };
-  })();
+  /** TypedStore handles — assigned in init() once host storage is available. */
+  private sessionsStore: TypedStore<SessionInfo[]> | null = null;
+  private terminalsStore: TypedStore<Record<string, PersistedTerminal>> | null =
+    null;
 
   /** In-memory map of ttyd PIDs keyed by session ID. */
   private ttydPids: Map<string, number> = new Map();
@@ -542,9 +373,24 @@ class ZellijSessionProvider implements SessionProvider {
    * Initialise the provider with host services. Called from onServerStart.
    */
   async init(services: HostServices): Promise<void> {
-    this.services = services;
-    if (services.logger) this.log = services.logger;
-    if (services.storage) this.storage = services.storage;
+    this.log = new BoundLogger(services.logger, PLUGIN_NAME);
+
+    if (services.storage) {
+      this.sessionsStore = new TypedStore<SessionInfo[]>(
+        services.storage,
+        STORAGE_NAMESPACE,
+        STORAGE_KEY_SESSIONS,
+        services.logger,
+        PLUGIN_NAME,
+      );
+      this.terminalsStore = new TypedStore<Record<string, PersistedTerminal>>(
+        services.storage,
+        STORAGE_NAMESPACE,
+        STORAGE_KEY_TERMINALS,
+        services.logger,
+        PLUGIN_NAME,
+      );
+    }
 
     this.log.info("ZellijSessionProvider initialising", {
       provider: this.name,
@@ -590,7 +436,7 @@ class ZellijSessionProvider implements SessionProvider {
     }
     await Promise.allSettled(stopPromises);
     try {
-      await this.storage.delete(STORAGE_NAMESPACE, "terminals");
+      await this.terminalsStore?.delete();
     } catch {
       /* ignore */
     }
@@ -605,7 +451,11 @@ class ZellijSessionProvider implements SessionProvider {
     // Attach-or-error on explicit externalName.
     if (config.externalName) {
       const target = config.externalName;
-      if (target.length === 0 || target.length > 128 || /[\0\r\n\s]/.test(target)) {
+      if (
+        target.length === 0 ||
+        target.length > 128 ||
+        /[\0\r\n\s]/.test(target)
+      ) {
         throw new Error(`Invalid externalName: ${target}`);
       }
       if (zellijSessionExists(target)) {
@@ -1016,7 +866,8 @@ class ZellijSessionProvider implements SessionProvider {
     }
 
     // Find available port
-    const assignedPort = port ?? (await findAvailablePort(TTYD_BASE_PORT));
+    const assignedPort =
+      port ?? (await findAvailablePort(TTYD_BASE_PORT, TTYD_PORT_RANGE));
 
     this.log.info("Starting ttyd terminal", {
       sessionId,
@@ -1595,31 +1446,18 @@ class ZellijSessionProvider implements SessionProvider {
    * Load all session records from persistent storage.
    */
   private async loadSessions(): Promise<SessionInfo[]> {
-    try {
-      const raw = await this.storage.get(
-        STORAGE_NAMESPACE,
-        STORAGE_KEY_SESSIONS,
-      );
-      if (!raw) return [];
-      return JSON.parse(raw) as SessionInfo[];
-    } catch (err) {
-      this.log.error("Failed to load sessions from storage", {
-        error: String(err),
-      });
-      return [];
-    }
+    if (!this.sessionsStore) return [];
+    const data = await this.sessionsStore.get();
+    return data ?? [];
   }
 
   /**
    * Save the full session list to persistent storage.
    */
   private async saveSessions(sessions: SessionInfo[]): Promise<void> {
+    if (!this.sessionsStore) return;
     try {
-      await this.storage.set(
-        STORAGE_NAMESPACE,
-        STORAGE_KEY_SESSIONS,
-        JSON.stringify(sessions),
-      );
+      await this.sessionsStore.set(sessions);
     } catch (err) {
       this.log.error("Failed to save sessions to storage", {
         error: String(err),
@@ -2005,7 +1843,8 @@ class ZellijSessionProvider implements SessionProvider {
   }
 
   private async persistTerminals(): Promise<void> {
-    const data: Record<string, { pid: number; port: number }> = {};
+    if (!this.terminalsStore) return;
+    const data: Record<string, PersistedTerminal> = {};
     for (const [sessionId, pid] of this.ttydPids) {
       const port = this.ttydPorts.get(sessionId);
       if (port !== undefined) {
@@ -2013,26 +1852,18 @@ class ZellijSessionProvider implements SessionProvider {
       }
     }
     try {
-      await this.storage.set(
-        STORAGE_NAMESPACE,
-        "terminals",
-        JSON.stringify(data),
-      );
+      await this.terminalsStore.set(data);
     } catch {
       this.log.warn("Failed to persist terminal state");
     }
   }
 
   private async loadPersistedTerminals(): Promise<
-    Record<string, { pid: number; port: number }>
+    Record<string, PersistedTerminal>
   > {
-    try {
-      const raw = await this.storage.get(STORAGE_NAMESPACE, "terminals");
-      if (!raw) return {};
-      return JSON.parse(raw);
-    } catch {
-      return {};
-    }
+    if (!this.terminalsStore) return {};
+    const data = await this.terminalsStore.get();
+    return data ?? {};
   }
 
   /**
@@ -2185,37 +2016,44 @@ class ZellijSessionProvider implements SessionProvider {
 
 const provider = new ZellijSessionProvider();
 
+// Lifecycle hooks via SDK — auto-emits `<plugin>.ready` telemetry,
+// skips init on Windows (zellij is POSIX-only — Windows users should use WSL2),
+// delegates to provider.
+const lifecycle = createLifecycleHooks({
+  name: PLUGIN_NAME,
+  skipPlatforms: ["win32"],
+  telemetryEventName: `${PLUGIN_NAME}.ready`,
+  onInit: async (services) => {
+    new ProviderRegistry(services).registerProvider(
+      "session",
+      PROVIDER_NAME,
+      provider,
+    );
+    new TelemetryEmitter(PLUGIN_NAME, PLUGIN_VERSION, services).emit(
+      "session.provider.ready",
+      { provider: "zellij" },
+    );
+    await provider.init(services);
+  },
+  onShutdown: async () => {
+    await provider.shutdown({ reason: "shutdown" });
+  },
+});
+
 const vibePlugin: VibePlugin = {
   capabilities: {
     storage: "rw",
     subprocess: true,
     telemetry: true,
   },
-  name: "session-zellij",
-  version: "2.3.0",
+  name: PLUGIN_NAME,
+  version: PLUGIN_VERSION,
   description:
     "Zellij + ttyd session provider — manages terminal sessions via Zellij and exposes web terminals via ttyd",
   tags: ["backend", "provider"],
 
-  providers: {
-    session: provider,
-  },
-
-  async onServerStart(services: HostServices): Promise<void> {
-    if (process.platform === "win32") {
-      throw new Error(
-        "session-zellij is not supported on native Windows. Use WSL2.",
-      );
-    }
-    services?.telemetry?.emit("session.provider.ready", { provider: "zellij" });
-    await provider.init(services);
-  },
-
-  async onServerStop(context?: {
-    reason: "reload" | "shutdown";
-  }): Promise<void> {
-    await provider.shutdown(context);
-  },
+  onServerStart: lifecycle.onServerStart,
+  onServerStop: lifecycle.onServerStop,
 };
 
 export { vibePlugin };
@@ -2229,6 +2067,4 @@ export type {
   HealthCheckResult,
   SystemSessionInfo,
   SystemTerminalInfo,
-  VibePlugin,
-  HostServices,
 };
