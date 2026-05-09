@@ -15,7 +15,9 @@ import { tmpdir } from "node:os";
 import { join as joinPath } from "node:path";
 import type {
   HostServices,
+  ProfileContext,
   VibePlugin,
+  VibePluginFactory,
 } from "@vibecontrols/plugin-sdk/contract";
 import { createLifecycleHooks } from "@vibecontrols/plugin-sdk/lifecycle";
 import { TypedStore } from "@vibecontrols/plugin-sdk/storage";
@@ -176,7 +178,7 @@ interface SessionProviderCapabilities {
 // ---------------------------------------------------------------------------
 
 const PLUGIN_NAME = "session-zellij";
-const PLUGIN_VERSION = "2026.509.2";
+const PLUGIN_VERSION = "2026.509.3";
 const PROVIDER_NAME = "session-zellij";
 const STORAGE_NAMESPACE = "session-zellij";
 const STORAGE_KEY_SESSIONS = "sessions";
@@ -2014,49 +2016,65 @@ class ZellijSessionProvider implements SessionProvider {
 // Plugin export
 // ---------------------------------------------------------------------------
 
+/**
+ * Module-level provider singleton — zellij sessions are global OS
+ * resources keyed by name and we must not spawn duplicate sessions per
+ * profile. The factory binds to this provider on first call and reuses
+ * it across createPlugin invocations.
+ */
 const provider = new ZellijSessionProvider();
 
-// Lifecycle hooks via SDK — auto-emits `<plugin>.ready` telemetry,
-// skips init on Windows (zellij is POSIX-only — Windows users should use WSL2),
-// delegates to provider.
-const lifecycle = createLifecycleHooks({
-  name: PLUGIN_NAME,
-  skipPlatforms: ["win32"],
-  telemetryEventName: `${PLUGIN_NAME}.ready`,
-  onInit: async (services) => {
-    new ProviderRegistry(services).registerProvider(
-      "session",
-      PROVIDER_NAME,
-      provider,
-    );
-    new TelemetryEmitter(PLUGIN_NAME, PLUGIN_VERSION, services).emit(
-      "session.provider.ready",
-      { provider: "zellij" },
-    );
-    await provider.init(services);
-  },
-  onShutdown: async () => {
-    await provider.shutdown({ reason: "shutdown" });
-  },
-});
+/**
+ * Plugin contract V2 factory. Builds a fresh VibePlugin (with its own
+ * lifecycle/telemetry instances) per call. The `provider` module-level
+ * binding is reused because zellij sessions are global OS resources.
+ */
+export const createPlugin: VibePluginFactory = (
+  _ctx: ProfileContext,
+): VibePlugin => {
+  // Lifecycle hooks via SDK — auto-emits `<plugin>.ready` telemetry,
+  // skips init on Windows (zellij is POSIX-only — Windows users should use WSL2),
+  // delegates to provider.
+  const lifecycle = createLifecycleHooks({
+    name: PLUGIN_NAME,
+    skipPlatforms: ["win32"],
+    telemetryEventName: `${PLUGIN_NAME}.ready`,
+    onInit: async (services: HostServices) => {
+      new ProviderRegistry(services).registerProvider(
+        "session",
+        PROVIDER_NAME,
+        provider,
+      );
+      new TelemetryEmitter(PLUGIN_NAME, PLUGIN_VERSION, services).emit(
+        "session.provider.ready",
+        { provider: "zellij" },
+      );
+      await provider.init(services);
+    },
+    onShutdown: async () => {
+      await provider.shutdown({ reason: "shutdown" });
+    },
+  });
 
-const vibePlugin: VibePlugin = {
-  capabilities: {
-    storage: "rw",
-    subprocess: true,
-    telemetry: true,
-  },
-  name: PLUGIN_NAME,
-  version: PLUGIN_VERSION,
-  description:
-    "Zellij + ttyd session provider — manages terminal sessions via Zellij and exposes web terminals via ttyd",
-  tags: ["backend", "provider"],
+  const plugin: VibePlugin = {
+    capabilities: {
+      storage: "rw",
+      subprocess: true,
+      telemetry: true,
+    },
+    name: PLUGIN_NAME,
+    version: PLUGIN_VERSION,
+    description:
+      "Zellij + ttyd session provider — manages terminal sessions via Zellij and exposes web terminals via ttyd",
+    tags: ["backend", "provider"],
 
-  onServerStart: lifecycle.onServerStart,
-  onServerStop: lifecycle.onServerStop,
+    onServerStart: lifecycle.onServerStart,
+    onServerStop: lifecycle.onServerStop,
+  };
+
+  return plugin;
 };
 
-export { vibePlugin };
 export type {
   SessionProvider,
   SessionProviderCapabilities,
