@@ -1,4 +1,4 @@
-# ai-review-standard: v3
+# ai-review-standard: v4
 name: AI PR Review
 
 on:
@@ -19,6 +19,7 @@ jobs:
   claude-review:
     name: Claude Code Review
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -53,6 +54,7 @@ jobs:
   opencode-minimax-review:
     name: OpenCode Review (Minimax M2.7)
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     env:
       MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -89,6 +91,7 @@ jobs:
   opencode-ollama-review:
     name: OpenCode Review (Ollama Qwen3.5)
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     env:
       OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -125,6 +128,7 @@ jobs:
   opencode-go-review:
     name: OpenCode Review (Deepseek v4 Pro)
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     env:
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
