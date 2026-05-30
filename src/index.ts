@@ -446,6 +446,78 @@ class ZellijSessionProvider implements SessionProvider {
     this.log.info("ZellijSessionProvider shutdown complete");
   }
 
+  /**
+   * Full teardown for `vibe nuke`. Force-reaps every ttyd (terminal-server)
+   * process and every zellij session this plugin spawned, then clears the
+   * plugin's persisted storage namespace. Returns the list of process kinds
+   * actually reaped. Runs while the daemon is still up, so the in-memory
+   * process maps are reachable.
+   */
+  async nuke(): Promise<string[]> {
+    const reaped: string[] = [];
+
+    // 1. Stop all tracked ttyd terminal-server processes (graceful), reusing
+    //    the existing per-session teardown so storage records are cleaned too.
+    const ttydCount = this.ttydPids.size;
+    const stopPromises: Promise<void>[] = [];
+    for (const [sessionId] of this.ttydPids) {
+      stopPromises.push(this.stopTerminal(sessionId));
+    }
+    await Promise.allSettled(stopPromises);
+
+    // 2. Belt-and-braces: force-reap any ttyd PIDs still alive (a graceful
+    //    stop may have left a straggler).
+    const killPromises: Promise<void>[] = [];
+    for (const pid of this.ttydPids.values()) {
+      if (isProcessAlive(pid)) {
+        killPromises.push(gracefulKill(pid).catch(() => undefined));
+      }
+    }
+    await Promise.allSettled(killPromises);
+    this.ttydPids.clear();
+    this.ttydPorts.clear();
+    if (ttydCount > 0) {
+      reaped.push(`${ttydCount} ttyd terminal-server process(es)`);
+    }
+
+    // 3. Kill + delete every zellij session this plugin created (tracked in
+    //    storage). Only reap our own (non-terminated) sessions — never touch
+    //    sessions we don't own.
+    let zellijKilled = 0;
+    const sessions = await this.loadSessions();
+    for (const session of sessions) {
+      if (session.status === "terminated") continue;
+      const zellijSessionName = this.getZellijSessionName(session);
+      if (zellijSessionExists(zellijSessionName)) {
+        zellijExecSilent(["kill-session", zellijSessionName]);
+        zellijExecSilent(["delete-session", zellijSessionName]);
+        zellijKilled++;
+      }
+    }
+    if (zellijKilled > 0) {
+      reaped.push(`${zellijKilled} zellij session(s)`);
+    }
+
+    // 4. Clear the plugin's persisted storage namespace.
+    try {
+      await this.sessionsStore?.delete();
+    } catch {
+      /* ignore */
+    }
+    try {
+      await this.terminalsStore?.delete();
+    } catch {
+      /* ignore */
+    }
+    reaped.push("session-zellij storage");
+
+    this.log.info("ZellijSessionProvider nuke complete", {
+      ttydReaped: ttydCount,
+      zellijKilled,
+    });
+    return reaped;
+  }
+
   // -----------------------------------------------------------------------
   // SessionProvider — create / terminate / getInfo / list
   // -----------------------------------------------------------------------
@@ -2142,6 +2214,22 @@ export const createPlugin: VibePluginFactory = (
     onShutdown: async () => {
       await provider.shutdown({ reason: "shutdown" });
     },
+    // `vibe nuke` runs this while the daemon is still up, so the provider
+    // singleton + its in-memory ttyd PID map are reachable. Force-reap every
+    // ttyd terminal-server and zellij session this plugin spawned and wipe its
+    // storage namespace. The agent never names ttyd or zellij — that knowledge
+    // lives here.
+    onNuke: async (_hostServices, ctx) => {
+      if (ctx.dryRun) {
+        return {
+          reaped: [
+            "ttyd terminal-server processes + zellij sessions + session-zellij storage",
+          ],
+        };
+      }
+      const reaped = await provider.nuke();
+      return { reaped };
+    },
   });
 
   const plugin: VibePlugin = {
@@ -2168,6 +2256,7 @@ export const createPlugin: VibePluginFactory = (
     createRoutes: () => createPrereqsRoutes(),
     onServerStart: lifecycle.onServerStart,
     onServerStop: lifecycle.onServerStop,
+    onNuke: lifecycle.onNuke,
   };
 
   return plugin;
