@@ -98,7 +98,6 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-
       - name: Create git tag (if manual dispatch)
         if: github.event_name == 'workflow_dispatch'
         run: |

@@ -13,6 +13,7 @@
 // No Subprocess import needed — we track PIDs only for restart resilience
 import { tmpdir } from "node:os";
 import { join as joinPath } from "node:path";
+import { Elysia } from "elysia";
 import type {
   HostServices,
   ProfileContext,
@@ -1536,6 +1537,22 @@ class ZellijSessionProvider implements SessionProvider {
   }
 
   /**
+   * Install zellij for the current platform by delegating to the existing
+   * platform-specific installers. Exposed publicly so the plugin's prereqs
+   * routes can drive the install on demand (the agent never installs tools
+   * itself — it only triggers this plugin via the prereqs protocol).
+   */
+  async installZellij(): Promise<void> {
+    if (isWindows()) {
+      await this.installZellijWindows();
+    } else if (isMacOS()) {
+      await this.installZellijMacOS();
+    } else {
+      await this.installZellijLinux();
+    }
+  }
+
+  /**
    * Ensure zellij is installed, auto-installing if missing.
    * Checks if `zellij` is in PATH and installs it if not found.
    */
@@ -2025,6 +2042,77 @@ class ZellijSessionProvider implements SessionProvider {
 const provider = new ZellijSessionProvider();
 
 /**
+ * Prereqs routes — this plugin OWNS installing the `zellij` binary via the
+ * agent's standard plugin prereqs protocol. The agent never installs tools
+ * itself; it only calls these endpoints. Install logic lives in the provider
+ * (delegated to via `provider.installZellij()`).
+ *
+ * `Bun.which` snapshots PATH at process start, so we always pass an explicit
+ * `{ PATH: process.env.PATH }` to honour any PATH mutations made by an install.
+ */
+function createPrereqsRoutes() {
+  return new Elysia({ prefix: "/prereqs" })
+    .get("/status", () => {
+      const satisfied =
+        Bun.which("zellij", { PATH: process.env.PATH }) !== null;
+      const missing = satisfied
+        ? []
+        : [{ name: "zellij", kind: "binary" as const, requiresSudo: false }];
+      return { satisfied, missing };
+    })
+    .post("/install", async () => {
+      // Already present — nothing to do.
+      if (Bun.which("zellij", { PATH: process.env.PATH }) !== null) {
+        return { ok: true, installed: [], pendingSudo: [], errors: [] };
+      }
+
+      try {
+        await provider.installZellij();
+      } catch (err) {
+        return {
+          ok: false,
+          installed: [] as string[],
+          pendingSudo: [] as {
+            name: string;
+            command: string;
+            reason: string;
+          }[],
+          errors: [
+            {
+              name: "zellij",
+              message: err instanceof Error ? err.message : String(err),
+            },
+          ],
+        };
+      }
+
+      // Re-verify against the live PATH after the install attempt.
+      if (Bun.which("zellij", { PATH: process.env.PATH }) !== null) {
+        return {
+          ok: true,
+          installed: ["zellij"],
+          pendingSudo: [],
+          errors: [],
+        };
+      }
+
+      return {
+        ok: false,
+        installed: [] as string[],
+        pendingSudo: [] as { name: string; command: string; reason: string }[],
+        errors: [
+          {
+            name: "zellij",
+            message:
+              "zellij install completed but the binary is not on PATH (you may need to restart the agent or open a new shell)",
+          },
+        ],
+      };
+    })
+    .post("/uninstall", () => ({ ok: true }));
+}
+
+/**
  * Plugin contract V2 factory. Builds a fresh VibePlugin (with its own
  * lifecycle/telemetry instances) per call. The `provider` module-level
  * binding is reused because zellij sessions are global OS resources.
@@ -2067,7 +2155,17 @@ export const createPlugin: VibePluginFactory = (
     description:
       "Zellij + ttyd session provider — manages terminal sessions via Zellij and exposes web terminals via ttyd",
     tags: ["backend", "provider"],
+    apiPrefix: "/api/session-zellij",
 
+    prerequisites: [
+      {
+        name: "zellij",
+        kind: "binary",
+        requiresSudo: false,
+      },
+    ],
+
+    createRoutes: () => createPrereqsRoutes(),
     onServerStart: lifecycle.onServerStart,
     onServerStop: lifecycle.onServerStop,
   };
