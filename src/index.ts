@@ -31,6 +31,12 @@ import {
 import { BoundLogger } from "@vibecontrols/plugin-sdk/log";
 import { TelemetryEmitter } from "@vibecontrols/plugin-sdk/telemetry";
 import { ProviderRegistry } from "@vibecontrols/plugin-sdk/providers";
+import {
+  installBinary,
+  resolveBinary,
+  type BinaryDownload,
+  type ToolPlatform,
+} from "@vibecontrols/plugin-sdk/install";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -71,6 +77,12 @@ interface TerminalInfo {
   url: string;
   port: number;
   pid: number;
+  /** Transport host the terminal-server (ttyd) binds to. */
+  host?: string;
+  /** WebSocket path the terminal-server exposes. */
+  wsPath?: string;
+  /** WebSocket subprotocols the terminal-server speaks. */
+  subprotocols?: string[];
 }
 
 interface HealthCheckResult {
@@ -187,6 +199,89 @@ const STORAGE_KEY_TERMINALS = "terminals";
 const TTYD_BASE_PORT = 8081;
 const TTYD_PORT_RANGE = 200;
 
+// Terminal transport constants — the ttyd terminal-server binds loopback and
+// exposes a WebSocket at /ws speaking the "tty" subprotocol. Consumers use
+// these to construct the live transport URL.
+const TERMINAL_HOST = "127.0.0.1";
+const TERMINAL_WS_PATH = "/ws";
+const TERMINAL_SUBPROTOCOLS = ["tty"];
+
+// ---------------------------------------------------------------------------
+// Provider-managed binaries (ttyd terminal-server + zellij multiplexer)
+//
+// This plugin OWNS downloading both binaries into the agent's binary cache
+// (~/.boff/vibecontrols/tools) via the SDK installer. The thin agent never
+// installs tools itself. Resolving by ABSOLUTE PATH (resolveBinary) sidesteps
+// the PATH snapshot `Bun.which` takes at process start, which otherwise makes
+// a mid-run install invisible to the running daemon (notably on Windows).
+// ---------------------------------------------------------------------------
+
+/**
+ * Official ttyd release assets per platform. ttyd ships raw static binaries;
+ * there is no macOS static binary upstream, so darwin-* is omitted (the
+ * /prereqs/install falls back to a manual instruction there).
+ */
+const TTYD_DOWNLOADS: Partial<Record<ToolPlatform, BinaryDownload>> = {
+  "linux-x64": {
+    url: "https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.x86_64",
+    archive: "raw",
+  },
+  "linux-arm64": {
+    url: "https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.aarch64",
+    archive: "raw",
+  },
+  "win32-x64": {
+    url: "https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.win32.exe",
+    archive: "raw",
+  },
+};
+
+/**
+ * Official zellij release assets per platform. zellij ships tar.gz archives
+ * with the `zellij` binary at the archive root. There is no Windows build, so
+ * win32-* is omitted (the /prereqs/install falls back to a manual instruction
+ * there — Windows users should run the agent under WSL2).
+ */
+const ZELLIJ_DOWNLOADS: Partial<Record<ToolPlatform, BinaryDownload>> = {
+  "linux-x64": {
+    url: "https://github.com/zellij-org/zellij/releases/latest/download/zellij-x86_64-unknown-linux-musl.tar.gz",
+    archive: "tar.gz",
+    binaryWithinArchive: "zellij",
+  },
+  "linux-arm64": {
+    url: "https://github.com/zellij-org/zellij/releases/latest/download/zellij-aarch64-unknown-linux-musl.tar.gz",
+    archive: "tar.gz",
+    binaryWithinArchive: "zellij",
+  },
+  "darwin-x64": {
+    url: "https://github.com/zellij-org/zellij/releases/latest/download/zellij-x86_64-apple-darwin.tar.gz",
+    archive: "tar.gz",
+    binaryWithinArchive: "zellij",
+  },
+  "darwin-arm64": {
+    url: "https://github.com/zellij-org/zellij/releases/latest/download/zellij-aarch64-apple-darwin.tar.gz",
+    archive: "tar.gz",
+    binaryWithinArchive: "zellij",
+  },
+};
+
+/**
+ * Resolve the ttyd terminal-server binary path. Prefers the provider-managed
+ * cache (absolute path), then the current PATH, then the bare name so the OS
+ * gives a sensible "command not found".
+ */
+function resolveTtydCmd(): string {
+  return resolveBinary("ttyd") ?? (isWindows() ? "ttyd.exe" : "ttyd");
+}
+
+/**
+ * Resolve the zellij binary path. Prefers the provider-managed cache (absolute
+ * path), then the current PATH, then the bare name.
+ */
+function resolveZellijCmd(): string {
+  return resolveBinary("zellij") ?? "zellij";
+}
+
 // ---------------------------------------------------------------------------
 // Zellij session info parsed from `zellij list-sessions`
 // ---------------------------------------------------------------------------
@@ -217,13 +312,6 @@ function isWindows(): boolean {
 }
 
 /**
- * Check if we are running on macOS.
- */
-function isMacOS(): boolean {
-  return process.platform === "darwin";
-}
-
-/**
  * Strip ANSI escape codes from a string.
  * Zellij's CLI output always includes color codes even with NO_COLOR.
  */
@@ -237,7 +325,7 @@ function stripAnsi(str: string): string {
  * Execute a zellij command and return its stdout. Throws on non-zero exit.
  */
 function zellijExec(args: string[]): string {
-  const result = Bun.spawnSync(["zellij", ...args], {
+  const result = Bun.spawnSync([resolveZellijCmd(), ...args], {
     stdout: "pipe",
     stderr: "pipe",
     timeout: 10_000,
@@ -255,7 +343,7 @@ function zellijExec(args: string[]): string {
  */
 function zellijExecSilent(args: string[]): boolean {
   try {
-    const result = Bun.spawnSync(["zellij", ...args], {
+    const result = Bun.spawnSync([resolveZellijCmd(), ...args], {
       stdout: "pipe",
       stderr: "pipe",
       timeout: 10_000,
@@ -556,9 +644,10 @@ class ZellijSessionProvider implements SessionProvider {
     // Spawn zellij session headlessly using `script` to provide a PTY.
     // Zellij requires a PTY to start; `script` provides one in headless mode.
     try {
+      const zellijCmd = resolveZellijCmd();
       if (isWindows()) {
         // On Windows, spawn zellij directly (no script command)
-        Bun.spawn(["zellij", "-s", zellijSessionName], {
+        Bun.spawn([zellijCmd, "-s", zellijSessionName], {
           stdin: "ignore",
           stdout: "ignore",
           stderr: "ignore",
@@ -570,7 +659,7 @@ class ZellijSessionProvider implements SessionProvider {
           [
             "sh",
             "-c",
-            `script -qfc "zellij -s ${zellijSessionName}" /dev/null </dev/null >/dev/null 2>&1`,
+            `script -qfc "${zellijCmd} -s ${zellijSessionName}" /dev/null </dev/null >/dev/null 2>&1`,
           ],
           {
             stdin: "ignore",
@@ -973,7 +1062,7 @@ class ZellijSessionProvider implements SessionProvider {
 
     const child = Bun.spawn(
       [
-        "ttyd",
+        resolveTtydCmd(),
         "-t",
         "fontSize=14",
         "-t",
@@ -981,7 +1070,7 @@ class ZellijSessionProvider implements SessionProvider {
         "--writable",
         "--port",
         String(assignedPort),
-        "zellij",
+        resolveZellijCmd(),
         "attach",
         zellijSessionName,
       ],
@@ -1009,6 +1098,9 @@ class ZellijSessionProvider implements SessionProvider {
       url: `http://localhost:${assignedPort}`,
       port: assignedPort,
       pid: child.pid,
+      host: TERMINAL_HOST,
+      wsPath: TERMINAL_WS_PATH,
+      subprotocols: TERMINAL_SUBPROTOCOLS,
     };
 
     // Update session record with terminal info
@@ -1211,13 +1303,9 @@ class ZellijSessionProvider implements SessionProvider {
       // Ignore — zero sessions
     }
 
-    // Check ttyd availability via Bun.which (handles PATHEXT on Windows).
-    let ttydOk = false;
-    try {
-      ttydOk = Bun.which("ttyd") !== null;
-    } catch {
-      // ttyd not found
-    }
+    // Check ttyd availability via resolveBinary — prefers the provider-managed
+    // cache (absolute path, immune to the Bun.which PATH snapshot), then PATH.
+    const ttydOk = resolveBinary("ttyd") !== null;
 
     const messages: string[] = [zellijVersion];
     if (!ttydOk) {
@@ -1605,331 +1693,80 @@ class ZellijSessionProvider implements SessionProvider {
       url: `http://localhost:${port}`,
       port,
       pid,
+      host: TERMINAL_HOST,
+      wsPath: TERMINAL_WS_PATH,
+      subprotocols: TERMINAL_SUBPROTOCOLS,
     };
   }
 
   /**
-   * Install zellij for the current platform by delegating to the existing
-   * platform-specific installers. Exposed publicly so the plugin's prereqs
-   * routes can drive the install on demand (the agent never installs tools
-   * itself — it only triggers this plugin via the prereqs protocol).
+   * Install the zellij multiplexer into the agent's binary cache via the SDK
+   * installer. Exposed publicly so the plugin's prereqs routes can drive the
+   * install on demand (the agent never installs tools itself — it only
+   * triggers this plugin via the prereqs protocol). Throws on failure so the
+   * caller can surface a manual fallback.
    */
   async installZellij(): Promise<void> {
-    if (isWindows()) {
-      await this.installZellijWindows();
-    } else if (isMacOS()) {
-      await this.installZellijMacOS();
-    } else {
-      await this.installZellijLinux();
-    }
+    await installBinary({
+      name: "zellij",
+      downloads: ZELLIJ_DOWNLOADS,
+      versionMatcher: "zellij",
+      log: {
+        info: (msg) => this.log.info(msg),
+        warn: (msg) => this.log.warn(msg),
+        error: (msg) => this.log.error(msg),
+      },
+    });
   }
 
   /**
-   * Ensure zellij is installed, auto-installing if missing.
-   * Checks if `zellij` is in PATH and installs it if not found.
+   * Install the ttyd terminal-server into the agent's binary cache via the SDK
+   * installer. Exposed publicly so the plugin's prereqs routes can drive the
+   * install on demand. Throws on failure so the caller can surface a manual
+   * fallback.
+   */
+  async installTtyd(): Promise<void> {
+    await installBinary({
+      name: "ttyd",
+      downloads: TTYD_DOWNLOADS,
+      versionMatcher: "ttyd version",
+      log: {
+        info: (msg) => this.log.info(msg),
+        warn: (msg) => this.log.warn(msg),
+        error: (msg) => this.log.error(msg),
+      },
+    });
+  }
+
+  /**
+   * Ensure zellij + ttyd are installed, auto-installing any that are missing.
+   * Resolves each via the provider-managed cache or PATH first; only downloads
+   * what is absent. Failures are logged (degrade gracefully) — the prereqs
+   * routes provide the explicit install/repair path.
    */
   private async ensureDependencies(): Promise<void> {
-    // Check if zellij is already available
-    try {
-      const result = Bun.spawnSync(["zellij", "--version"], {
-        stdout: "pipe",
-        stderr: "pipe",
-        timeout: 10_000,
-      });
-      if (result.exitCode === 0) {
-        this.log.debug("zellij is already installed", {
-          version: result.stdout.toString("utf-8").trim(),
-        });
-        return;
+    if (resolveBinary("zellij") === null) {
+      this.log.info("zellij not found — attempting auto-install");
+      try {
+        await this.installZellij();
+        this.log.info("zellij auto-installed successfully");
+      } catch (err) {
+        this.log.error("zellij auto-install failed", { error: String(err) });
       }
-    } catch {
-      // Not found — proceed to install
-    }
-
-    this.log.info("zellij not found in PATH — attempting auto-install");
-
-    if (isWindows()) {
-      await this.installZellijWindows();
-    } else if (isMacOS()) {
-      await this.installZellijMacOS();
     } else {
-      await this.installZellijLinux();
+      this.log.debug("zellij already available");
     }
 
-    // Verify installation
-    try {
-      const result = Bun.spawnSync(["zellij", "--version"], {
-        stdout: "pipe",
-        stderr: "pipe",
-        timeout: 10_000,
-      });
-      if (result.exitCode === 0) {
-        this.log.info("zellij auto-installed successfully", {
-          version: result.stdout.toString("utf-8").trim(),
-        });
-      } else {
-        this.log.error("zellij auto-install completed but verification failed");
-      }
-    } catch {
-      this.log.error("zellij auto-install completed but binary is not in PATH");
-    }
-  }
-
-  /**
-   * Install zellij on Linux by downloading the prebuilt binary.
-   */
-  private async installZellijLinux(): Promise<void> {
-    const url =
-      "https://github.com/zellij-org/zellij/releases/latest/download/zellij-x86_64-unknown-linux-musl.tar.gz";
-    const homeDir = process.env.HOME || "/root";
-    const binDir = `${homeDir}/bin`;
-    const tarPath = joinPath(tmpdir(), `zellij-install-${Date.now()}.tar.gz`);
-
-    try {
-      // Ensure ~/bin exists
-      Bun.spawnSync(["mkdir", "-p", binDir], {
-        stdout: "pipe",
-        stderr: "pipe",
-        timeout: 5000,
-      });
-
-      this.log.info("Downloading zellij for Linux", { url, binDir });
-
-      // Download the tarball
-      const downloadResult = Bun.spawnSync(
-        ["curl", "-fsSL", "-o", tarPath, url],
-        {
-          stdout: "pipe",
-          stderr: "pipe",
-          timeout: 120_000,
-        },
-      );
-
-      if (downloadResult.exitCode !== 0) {
-        const stderr = downloadResult.stderr.toString().trim();
-        throw new Error(`Failed to download zellij: ${stderr}`);
-      }
-
-      // Extract to ~/bin
-      const extractResult = Bun.spawnSync(
-        ["tar", "-xzf", tarPath, "-C", binDir],
-        {
-          stdout: "pipe",
-          stderr: "pipe",
-          timeout: 30_000,
-        },
-      );
-
-      if (extractResult.exitCode !== 0) {
-        const stderr = extractResult.stderr.toString().trim();
-        throw new Error(`Failed to extract zellij: ${stderr}`);
-      }
-
-      // Make executable
-      Bun.spawnSync(["chmod", "+x", `${binDir}/zellij`], {
-        stdout: "pipe",
-        stderr: "pipe",
-        timeout: 5000,
-      });
-
-      // Ensure ~/bin is in PATH for this process
-      if (!process.env.PATH?.includes(binDir)) {
-        process.env.PATH = `${binDir}:${process.env.PATH}`;
-      }
-
-      this.log.info("zellij installed to ~/bin/zellij");
-    } catch (err) {
-      this.log.error("Failed to install zellij on Linux", {
-        error: String(err),
-      });
-    } finally {
-      // Clean up tarball
+    if (resolveBinary("ttyd") === null) {
+      this.log.info("ttyd not found — attempting auto-install");
       try {
-        Bun.spawnSync(["rm", "-f", tarPath], {
-          stdout: "pipe",
-          stderr: "pipe",
-          timeout: 5000,
-        });
-      } catch {
-        // Best-effort cleanup
+        await this.installTtyd();
+        this.log.info("ttyd auto-installed successfully");
+      } catch (err) {
+        this.log.error("ttyd auto-install failed", { error: String(err) });
       }
-    }
-  }
-
-  /**
-   * Install zellij on macOS. Tries Homebrew first, falls back to direct download.
-   */
-  private async installZellijMacOS(): Promise<void> {
-    // Try Homebrew first
-    try {
-      const brewResult = Bun.spawnSync(["brew", "install", "zellij"], {
-        stdout: "pipe",
-        stderr: "pipe",
-        timeout: 300_000, // brew can be slow
-      });
-
-      if (brewResult.exitCode === 0) {
-        this.log.info("zellij installed via Homebrew");
-        return;
-      }
-
-      this.log.warn("Homebrew install failed, falling back to direct download");
-    } catch {
-      this.log.warn("Homebrew not available, falling back to direct download");
-    }
-
-    // Fallback: direct download (Apple Silicon by default, fallback to x86_64)
-    const arch = process.arch === "arm64" ? "aarch64" : "x86_64";
-    const url = `https://github.com/zellij-org/zellij/releases/latest/download/zellij-${arch}-apple-darwin.tar.gz`;
-    const homeDir = process.env.HOME || "/Users/Shared";
-    const binDir = `${homeDir}/bin`;
-    const tarPath = joinPath(tmpdir(), `zellij-install-${Date.now()}.tar.gz`);
-
-    try {
-      Bun.spawnSync(["mkdir", "-p", binDir], {
-        stdout: "pipe",
-        stderr: "pipe",
-        timeout: 5000,
-      });
-
-      this.log.info("Downloading zellij for macOS", { url, binDir });
-
-      const downloadResult = Bun.spawnSync(
-        ["curl", "-fsSL", "-o", tarPath, url],
-        {
-          stdout: "pipe",
-          stderr: "pipe",
-          timeout: 120_000,
-        },
-      );
-
-      if (downloadResult.exitCode !== 0) {
-        const stderr = downloadResult.stderr.toString().trim();
-        throw new Error(`Failed to download zellij: ${stderr}`);
-      }
-
-      const extractResult = Bun.spawnSync(
-        ["tar", "-xzf", tarPath, "-C", binDir],
-        {
-          stdout: "pipe",
-          stderr: "pipe",
-          timeout: 30_000,
-        },
-      );
-
-      if (extractResult.exitCode !== 0) {
-        const stderr = extractResult.stderr.toString().trim();
-        throw new Error(`Failed to extract zellij: ${stderr}`);
-      }
-
-      Bun.spawnSync(["chmod", "+x", `${binDir}/zellij`], {
-        stdout: "pipe",
-        stderr: "pipe",
-        timeout: 5000,
-      });
-
-      if (!process.env.PATH?.includes(binDir)) {
-        process.env.PATH = `${binDir}:${process.env.PATH}`;
-      }
-
-      this.log.info("zellij installed to ~/bin/zellij");
-    } catch (err) {
-      this.log.error("Failed to install zellij on macOS", {
-        error: String(err),
-      });
-    } finally {
-      try {
-        Bun.spawnSync(["rm", "-f", tarPath], {
-          stdout: "pipe",
-          stderr: "pipe",
-          timeout: 5000,
-        });
-      } catch {
-        // Best-effort cleanup
-      }
-    }
-  }
-
-  /**
-   * Install zellij on Windows by downloading the prebuilt binary.
-   */
-  private async installZellijWindows(): Promise<void> {
-    const url =
-      "https://github.com/zellij-org/zellij/releases/latest/download/zellij-x86_64-pc-windows-msvc.zip";
-    const localAppData =
-      process.env.LOCALAPPDATA || `${process.env.USERPROFILE}\\AppData\\Local`;
-    const installDir = `${localAppData}\\Programs\\Zellij`;
-    const zipPath = `${process.env.TEMP || "C:\\Temp"}\\zellij-install-${Date.now()}.zip`;
-
-    try {
-      // Create install directory
-      Bun.spawnSync(["cmd", "/c", `mkdir "${installDir}" 2>nul`], {
-        stdout: "pipe",
-        stderr: "pipe",
-        timeout: 5000,
-      });
-
-      this.log.info("Downloading zellij for Windows", { url, installDir });
-
-      // Download using PowerShell
-      const downloadResult = Bun.spawnSync(
-        [
-          "powershell",
-          "-Command",
-          `Invoke-WebRequest -Uri "${url}" -OutFile "${zipPath}" -UseBasicParsing`,
-        ],
-        {
-          stdout: "pipe",
-          stderr: "pipe",
-          timeout: 120_000,
-        },
-      );
-
-      if (downloadResult.exitCode !== 0) {
-        const stderr = downloadResult.stderr.toString().trim();
-        throw new Error(`Failed to download zellij: ${stderr}`);
-      }
-
-      // Extract using PowerShell
-      const extractResult = Bun.spawnSync(
-        [
-          "powershell",
-          "-Command",
-          `Expand-Archive -Path "${zipPath}" -DestinationPath "${installDir}" -Force`,
-        ],
-        {
-          stdout: "pipe",
-          stderr: "pipe",
-          timeout: 30_000,
-        },
-      );
-
-      if (extractResult.exitCode !== 0) {
-        const stderr = extractResult.stderr.toString().trim();
-        throw new Error(`Failed to extract zellij: ${stderr}`);
-      }
-
-      // Add to PATH for this process
-      if (!process.env.PATH?.includes(installDir)) {
-        process.env.PATH = `${installDir};${process.env.PATH}`;
-      }
-
-      this.log.info(`zellij installed to ${installDir}`);
-    } catch (err) {
-      this.log.error("Failed to install zellij on Windows", {
-        error: String(err),
-      });
-    } finally {
-      // Clean up zip
-      try {
-        Bun.spawnSync(["cmd", "/c", `del /q "${zipPath}" 2>nul`], {
-          stdout: "pipe",
-          stderr: "pipe",
-          timeout: 5000,
-        });
-      } catch {
-        // Best-effort cleanup
-      }
+    } else {
+      this.log.debug("ttyd already available");
     }
   }
 
@@ -2007,6 +1844,9 @@ class ZellijSessionProvider implements SessionProvider {
             url: `http://localhost:${termData.port}`,
             port: termData.port,
             pid: termData.pid,
+            host: TERMINAL_HOST,
+            wsPath: TERMINAL_WS_PATH,
+            subprotocols: TERMINAL_SUBPROTOCOLS,
           };
           session.status = "active";
           session.updatedAt = nowISO();
@@ -2078,6 +1918,9 @@ class ZellijSessionProvider implements SessionProvider {
             url: `http://localhost:${port}`,
             port,
             pid,
+            host: TERMINAL_HOST,
+            wsPath: TERMINAL_WS_PATH,
+            subprotocols: TERMINAL_SUBPROTOCOLS,
           };
           matchedSession.status = "active";
           matchedSession.updatedAt = nowISO();
@@ -2122,63 +1965,94 @@ const provider = new ZellijSessionProvider();
  * `Bun.which` snapshots PATH at process start, so we always pass an explicit
  * `{ PATH: process.env.PATH }` to honour any PATH mutations made by an install.
  */
+interface PendingSudo {
+  name: string;
+  command: string;
+  reason: string;
+}
+
+/** Check if we are running on macOS (used for manual-install fallbacks). */
+function isMacOSPlatform(): boolean {
+  return process.platform === "darwin";
+}
+
+/** Manual install instruction for a tool when the auto-download fails. */
+function manualInstructionFor(tool: "zellij" | "ttyd"): string {
+  if (tool === "zellij") {
+    return isWindows()
+      ? "zellij has no native Windows build — run the agent under WSL2, then: cargo install zellij    # or download from https://github.com/zellij-org/zellij/releases"
+      : isMacOSPlatform()
+        ? "brew install zellij    # or download from https://github.com/zellij-org/zellij/releases"
+        : "see https://github.com/zellij-org/zellij/releases for prebuilt binaries";
+  }
+  // ttyd
+  return isWindows()
+    ? "scoop install ttyd    # or download ttyd.win32.exe from https://github.com/tsl0922/ttyd/releases"
+    : isMacOSPlatform()
+      ? "brew install ttyd    # ttyd ships no static macOS binary"
+      : "see https://github.com/tsl0922/ttyd/releases for prebuilt binaries";
+}
+
 function createPrereqsRoutes() {
   return new Elysia({ prefix: "/prereqs" })
     .get("/status", () => {
-      const satisfied =
-        Bun.which("zellij", { PATH: process.env.PATH }) !== null;
-      const missing = satisfied
-        ? []
-        : [{ name: "zellij", kind: "binary" as const, requiresSudo: false }];
-      return { satisfied, missing };
+      const zellijOk = resolveBinary("zellij") !== null;
+      const ttydOk = resolveBinary("ttyd") !== null;
+      const missing: Array<{
+        name: string;
+        kind: "binary";
+        requiresSudo: boolean;
+      }> = [];
+      if (!zellijOk) {
+        missing.push({ name: "zellij", kind: "binary", requiresSudo: false });
+      }
+      if (!ttydOk) {
+        missing.push({ name: "ttyd", kind: "binary", requiresSudo: false });
+      }
+      return { satisfied: missing.length === 0, missing };
     })
     .post("/install", async () => {
-      // Already present — nothing to do.
-      if (Bun.which("zellij", { PATH: process.env.PATH }) !== null) {
-        return { ok: true, installed: [], pendingSudo: [], errors: [] };
+      const installed: string[] = [];
+      const pendingSudo: PendingSudo[] = [];
+      const errors: Array<{ name: string; message: string }> = [];
+
+      // zellij — download into the agent binary cache if absent.
+      if (resolveBinary("zellij") === null) {
+        try {
+          await provider.installZellij();
+          installed.push("zellij");
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          pendingSudo.push({
+            name: "zellij",
+            command: manualInstructionFor("zellij"),
+            reason: `zellij auto-download failed: ${message}`,
+          });
+          errors.push({ name: "zellij", message });
+        }
       }
 
-      try {
-        await provider.installZellij();
-      } catch (err) {
-        return {
-          ok: false,
-          installed: [] as string[],
-          pendingSudo: [] as {
-            name: string;
-            command: string;
-            reason: string;
-          }[],
-          errors: [
-            {
-              name: "zellij",
-              message: err instanceof Error ? err.message : String(err),
-            },
-          ],
-        };
-      }
-
-      // Re-verify against the live PATH after the install attempt.
-      if (Bun.which("zellij", { PATH: process.env.PATH }) !== null) {
-        return {
-          ok: true,
-          installed: ["zellij"],
-          pendingSudo: [],
-          errors: [],
-        };
+      // ttyd — download into the agent binary cache if absent.
+      if (resolveBinary("ttyd") === null) {
+        try {
+          await provider.installTtyd();
+          installed.push("ttyd");
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          pendingSudo.push({
+            name: "ttyd",
+            command: manualInstructionFor("ttyd"),
+            reason: `ttyd auto-download failed: ${message}`,
+          });
+          errors.push({ name: "ttyd", message });
+        }
       }
 
       return {
-        ok: false,
-        installed: [] as string[],
-        pendingSudo: [] as { name: string; command: string; reason: string }[],
-        errors: [
-          {
-            name: "zellij",
-            message:
-              "zellij install completed but the binary is not on PATH (you may need to restart the agent or open a new shell)",
-          },
-        ],
+        ok: errors.length === 0,
+        installed,
+        pendingSudo,
+        errors,
       };
     })
     .post("/uninstall", () => ({ ok: true }));
@@ -2248,6 +2122,11 @@ export const createPlugin: VibePluginFactory = (
     prerequisites: [
       {
         name: "zellij",
+        kind: "binary",
+        requiresSudo: false,
+      },
+      {
+        name: "ttyd",
         kind: "binary",
         requiresSudo: false,
       },
