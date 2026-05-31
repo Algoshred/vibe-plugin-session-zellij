@@ -240,10 +240,9 @@ const TTYD_DOWNLOADS: Partial<Record<ToolPlatform, BinaryDownload>> = {
 };
 
 /**
- * Official zellij release assets per platform. zellij ships tar.gz archives
- * with the `zellij` binary at the archive root. There is no Windows build, so
- * win32-* is omitted (the /prereqs/install falls back to a manual instruction
- * there — Windows users should run the agent under WSL2).
+ * Official zellij release assets per platform. zellij ships tar.gz archives on
+ * POSIX platforms and a zip with `zellij.exe` at the archive root on Windows.
+ * Windows arm64 is omitted because upstream currently publishes x86_64 only.
  */
 const ZELLIJ_DOWNLOADS: Partial<Record<ToolPlatform, BinaryDownload>> = {
   "linux-x64": {
@@ -265,6 +264,11 @@ const ZELLIJ_DOWNLOADS: Partial<Record<ToolPlatform, BinaryDownload>> = {
     url: "https://github.com/zellij-org/zellij/releases/latest/download/zellij-aarch64-apple-darwin.tar.gz",
     archive: "tar.gz",
     binaryWithinArchive: "zellij",
+  },
+  "win32-x64": {
+    url: "https://github.com/zellij-org/zellij/releases/latest/download/zellij-x86_64-pc-windows-msvc.zip",
+    archive: "zip",
+    binaryWithinArchive: "zellij.exe",
   },
 };
 
@@ -717,7 +721,7 @@ class ZellijSessionProvider implements SessionProvider {
     // Spawn zellij session headlessly using `script` to provide a PTY.
     // Zellij requires a PTY to start; `script` provides one in headless mode.
     try {
-      const zellijCmd = resolveZellijCmd();
+      const zellijCmd = await ensureZellijBinary(this.log);
       if (isWindows()) {
         // On Windows, spawn zellij directly (no script command)
         Bun.spawn([zellijCmd, "-s", zellijSessionName], {
@@ -1645,7 +1649,7 @@ class ZellijSessionProvider implements SessionProvider {
         clipboard: false,
         search: true,
       },
-      platform: ["linux", "macos"],
+      platform: ["linux", "macos", "windows"],
     };
   }
 
@@ -2094,7 +2098,7 @@ function isMacOSPlatform(): boolean {
 function manualInstructionFor(tool: "zellij" | "ttyd"): string {
   if (tool === "zellij") {
     return isWindows()
-      ? "zellij has no native Windows build — run the agent under WSL2, then: cargo install zellij    # or download from https://github.com/zellij-org/zellij/releases"
+      ? "irm https://zellij.dev/launch.ps1 | iex    # or download zellij-x86_64-pc-windows-msvc.zip from https://github.com/zellij-org/zellij/releases"
       : isMacOSPlatform()
         ? "brew install zellij    # or download from https://github.com/zellij-org/zellij/releases"
         : "see https://github.com/zellij-org/zellij/releases for prebuilt binaries";
@@ -2180,12 +2184,10 @@ function createPrereqsRoutes() {
 export const createPlugin: VibePluginFactory = (
   _ctx: ProfileContext,
 ): VibePlugin => {
-  // Lifecycle hooks via SDK — auto-emits `<plugin>.ready` telemetry,
-  // skips init on Windows (zellij is POSIX-only — Windows users should use WSL2),
+  // Lifecycle hooks via SDK — auto-emits `<plugin>.ready` telemetry and
   // delegates to provider.
   const lifecycle = createLifecycleHooks({
     name: PLUGIN_NAME,
-    skipPlatforms: ["win32"],
     telemetryEventName: `${PLUGIN_NAME}.ready`,
     onInit: async (services: HostServices) => {
       new ProviderRegistry(services).registerProvider(
