@@ -11,8 +11,10 @@
  */
 
 // No Subprocess import needed — we track PIDs only for restart resilience
+import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join as joinPath } from "node:path";
+import { dirname, join as joinPath } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Elysia } from "elysia";
 import type {
   HostServices,
@@ -191,7 +193,8 @@ interface SessionProviderCapabilities {
 // ---------------------------------------------------------------------------
 
 const PLUGIN_NAME = "session-zellij";
-const PLUGIN_VERSION = "2026.509.3";
+const PLUGIN_PACKAGE_NAME = "@vibecontrols/vibe-plugin-session-zellij";
+const PLUGIN_VERSION = getPluginVersion();
 const PROVIDER_NAME = "session-zellij";
 const STORAGE_NAMESPACE = "session-zellij";
 const STORAGE_KEY_SESSIONS = "sessions";
@@ -265,19 +268,60 @@ const ZELLIJ_DOWNLOADS: Partial<Record<ToolPlatform, BinaryDownload>> = {
   },
 };
 
-/**
- * Resolve the ttyd terminal-server binary path. Prefers the provider-managed
- * cache (absolute path), then the current PATH, then the bare name so the OS
- * gives a sensible "command not found".
- */
-function resolveTtydCmd(): string {
-  return resolveBinary("ttyd") ?? (isWindows() ? "ttyd.exe" : "ttyd");
+async function ensureTtydBinary(log?: BoundLogger): Promise<string> {
+  const existing = resolveBinary("ttyd");
+  if (existing) return existing;
+
+  log?.info("ttyd not found — attempting auto-install");
+  try {
+    const installed = await installBinary({
+      name: "ttyd",
+      downloads: TTYD_DOWNLOADS,
+      versionMatcher: "ttyd version",
+      log: {
+        info: (msg) => log?.info(msg),
+        warn: (msg) => log?.warn(msg),
+        error: (msg) => log?.error(msg),
+      },
+    });
+    log?.info("ttyd auto-installed", { path: installed });
+    return installed;
+  } catch (err) {
+    const cause = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `ttyd is not available and auto-install failed. ${manualInstructionFor("ttyd")}. Cause: ${cause}`,
+      { cause: err },
+    );
+  }
 }
 
-/**
- * Resolve the zellij binary path. Prefers the provider-managed cache (absolute
- * path), then the current PATH, then the bare name.
- */
+async function ensureZellijBinary(log?: BoundLogger): Promise<string> {
+  const existing = resolveBinary("zellij");
+  if (existing) return existing;
+
+  log?.info("zellij not found — attempting auto-install");
+  try {
+    const installed = await installBinary({
+      name: "zellij",
+      downloads: ZELLIJ_DOWNLOADS,
+      versionMatcher: "zellij",
+      log: {
+        info: (msg) => log?.info(msg),
+        warn: (msg) => log?.warn(msg),
+        error: (msg) => log?.error(msg),
+      },
+    });
+    log?.info("zellij auto-installed", { path: installed });
+    return installed;
+  } catch (err) {
+    const cause = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `zellij is not available and auto-install failed. ${manualInstructionFor("zellij")}. Cause: ${cause}`,
+      { cause: err },
+    );
+  }
+}
+
 function resolveZellijCmd(): string {
   return resolveBinary("zellij") ?? "zellij";
 }
@@ -309,6 +353,35 @@ function generateId(): string {
  */
 function isWindows(): boolean {
   return process.platform === "win32";
+}
+
+function getPluginVersion(): string {
+  try {
+    let dir = dirname(fileURLToPath(import.meta.url));
+    for (let i = 0; i < 10 && dir && dir !== dirname(dir); i++) {
+      const pkgPath = joinPath(dir, "package.json");
+      if (existsSync(pkgPath)) {
+        try {
+          const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as {
+            name?: string;
+            version?: string;
+          };
+          if (
+            pkg.name === PLUGIN_PACKAGE_NAME &&
+            typeof pkg.version === "string"
+          ) {
+            return pkg.version;
+          }
+        } catch {
+          /* malformed package.json — keep walking up */
+        }
+      }
+      dir = dirname(dir);
+    }
+  } catch {
+    /* fall through */
+  }
+  return "0.0.0";
 }
 
 /**
@@ -1069,32 +1142,46 @@ class ZellijSessionProvider implements SessionProvider {
       }
     }
 
-    const child = Bun.spawn(
-      [
-        resolveTtydCmd(),
-        "-t",
-        "fontSize=14",
-        "-t",
-        `theme={"background":"#1e1e1e","foreground":"#cccccc"}`,
-        "--writable",
-        "--port",
-        String(assignedPort),
-        resolveZellijCmd(),
-        "attach",
-        zellijSessionName,
-      ],
-      {
-        stdout: "ignore",
-        // Pipe stderr so a ttyd that exits on launch (port already bound,
-        // missing mux target, bad binary) is DIAGNOSABLE instead of being
-        // stored with a soon-dead PID that only surfaces downstream as the
-        // opaque "Terminal not running for this session". Drained (capped)
-        // below so the pipe never blocks a long-lived ttyd.
-        stderr: "pipe",
-        stdin: "ignore",
-        env: ttydEnv as Record<string, string>,
-      },
-    );
+    const ttydCmd = await ensureTtydBinary(this.log);
+    const zellijCmd = await ensureZellijBinary(this.log);
+    let child: ReturnType<typeof Bun.spawn>;
+    try {
+      child = Bun.spawn(
+        [
+          ttydCmd,
+          "-t",
+          "fontSize=14",
+          "-t",
+          `theme={"background":"#1e1e1e","foreground":"#cccccc"}`,
+          "--writable",
+          "--port",
+          String(assignedPort),
+          zellijCmd,
+          "attach",
+          zellijSessionName,
+        ],
+        {
+          stdout: "ignore",
+          // Pipe stderr so a ttyd that exits on launch (port already bound,
+          // missing mux target, bad binary) is DIAGNOSABLE instead of being
+          // stored with a soon-dead PID that only surfaces downstream as the
+          // opaque "Terminal not running for this session". Drained (capped)
+          // below so the pipe never blocks a long-lived ttyd.
+          stderr: "pipe",
+          stdin: "ignore",
+          env: ttydEnv as Record<string, string>,
+        },
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (/ENOENT|no such file|not found|uv_spawn/i.test(message)) {
+        throw new Error(
+          `zellij terminal could not spawn ttyd="${ttydCmd}" zellij="${zellijCmd}". Cause: ${message}`,
+          { cause: err },
+        );
+      }
+      throw err;
+    }
 
     if (!child.pid) {
       throw new Error("Failed to start ttyd — no PID returned");
@@ -1752,16 +1839,7 @@ class ZellijSessionProvider implements SessionProvider {
    * caller can surface a manual fallback.
    */
   async installZellij(): Promise<void> {
-    await installBinary({
-      name: "zellij",
-      downloads: ZELLIJ_DOWNLOADS,
-      versionMatcher: "zellij",
-      log: {
-        info: (msg) => this.log.info(msg),
-        warn: (msg) => this.log.warn(msg),
-        error: (msg) => this.log.error(msg),
-      },
-    });
+    await ensureZellijBinary(this.log);
   }
 
   /**
@@ -1771,16 +1849,7 @@ class ZellijSessionProvider implements SessionProvider {
    * fallback.
    */
   async installTtyd(): Promise<void> {
-    await installBinary({
-      name: "ttyd",
-      downloads: TTYD_DOWNLOADS,
-      versionMatcher: "ttyd version",
-      log: {
-        info: (msg) => this.log.info(msg),
-        warn: (msg) => this.log.warn(msg),
-        error: (msg) => this.log.error(msg),
-      },
-    });
+    await ensureTtydBinary(this.log);
   }
 
   /**
