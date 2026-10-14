@@ -53,6 +53,7 @@ jobs:
 
   opencode-minimax-review:
     name: OpenCode Review (Minimax M2.7)
+    if: vars.AI_REVIEW_OPENCODE_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 3
     env:
@@ -90,6 +91,7 @@ jobs:
 
   opencode-ollama-review:
     name: OpenCode Review (Ollama Qwen3.5)
+    if: vars.AI_REVIEW_OPENCODE_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 3
     env:
@@ -127,6 +129,7 @@ jobs:
 
   opencode-go-review:
     name: OpenCode Review (Deepseek v4 Pro)
+    if: vars.AI_REVIEW_OPENCODE_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 3
     env:
