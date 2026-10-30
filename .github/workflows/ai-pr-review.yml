@@ -9,7 +9,6 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
-  id-token: write
 
 concurrency:
   group: ai-pr-review-${{ github.event.pull_request.number }}
@@ -17,6 +16,13 @@ concurrency:
 
 jobs:
   claude-review:
+    # id-token stays scoped to this job: claude-code-action exchanges an OIDC token for its
+    # GitHub App token and runs no PR-branch code. Jobs that run branch code get none (BOFF-10196).
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
     name: Claude Code Review
     runs-on: ubuntu-latest
     timeout-minutes: 3
@@ -60,7 +66,6 @@ jobs:
       MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     permissions:
-      id-token: write
       contents: read
       pull-requests: write
       issues: write
@@ -98,7 +103,6 @@ jobs:
       OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     permissions:
-      id-token: write
       contents: read
       pull-requests: write
       issues: write
@@ -136,7 +140,6 @@ jobs:
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     permissions:
-      id-token: write
       contents: read
       pull-requests: write
       issues: write
