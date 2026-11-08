@@ -483,13 +483,12 @@ function listZellijSessions(): ZellijSessionListEntry[] {
 
       // Extract session name (first token before whitespace or bracket)
       const nameMatch = trimmed.match(/^(\S+)/);
-      if (!nameMatch) continue;
-
-      const name = nameMatch[1];
+      const name = nameMatch?.[1];
+      if (!name) continue;
 
       // Try to extract creation time info from bracketed content
       const bracketMatch = trimmed.match(/\[Created\s+(.+?)\s+ago\]/i);
-      const createdAt = bracketMatch ? bracketMatch[1] : undefined;
+      const createdAt = bracketMatch?.[1];
 
       entries.push({ name, createdAt });
     }
