@@ -62,10 +62,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/algoshred/vibe-plugin-session-zellij.git"
+    "url": "git+https://github.com/Algoshred/vibe-plugin-session-zellij.git"
   },
   "bugs": {
-    "url": "https://github.com/algoshred/vibe-plugin-session-zellij/issues"
+    "url": "https://github.com/Algoshred/vibe-plugin-session-zellij/issues"
   },
   "homepage": "https://vibecontrols.com",
   "publishConfig": {
