@@ -343,6 +343,53 @@ interface ZellijSessionListEntry {
 // Helpers
 // ---------------------------------------------------------------------------
 
+const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+/**
+ * Enforce strict session ID validation to prevent shell metacharacter or
+ * argument injection when constructing Zellij session names.
+ */
+export function validateSessionId(id: string): string {
+  if (typeof id !== "string" || !SESSION_ID_RE.test(id)) {
+    throw new Error(`Invalid session id: ${String(id)}`);
+  }
+  return id;
+}
+
+function posixSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * Build the direct `Bun.spawn` argv array to start a headless Zellij session
+ * without invoking `sh -c`. Stdio must be redirected via `Bun.spawn`'s
+ * `{ stdin: "ignore", stdout: "ignore", stderr: "ignore" }`.
+ */
+export function buildZellijSpawnArgs(
+  zellijCmd: string,
+  sessionName: string,
+  platform: NodeJS.Platform = process.platform,
+): string[] {
+  if (!zellijCmd || /[\0\r\n]/.test(zellijCmd)) {
+    throw new Error("Invalid zellij binary path");
+  }
+  if (!SESSION_ID_RE.test(sessionName)) {
+    throw new Error(`Invalid zellij session name: ${sessionName}`);
+  }
+  if (platform === "win32") {
+    return [zellijCmd, "-s", sessionName];
+  }
+  if (platform === "darwin") {
+    return ["script", "-q", "/dev/null", zellijCmd, "-s", sessionName];
+  }
+  return [
+    "script",
+    "-qfc",
+    `${posixSingleQuote(zellijCmd)} -s ${sessionName}`,
+    "/dev/null",
+  ];
+}
+
 /**
  * Generate a short random hex ID (8 chars) for session identifiers.
  */
@@ -707,7 +754,8 @@ class ZellijSessionProvider implements SessionProvider {
         `No zellij session named "${target}" — drop externalName to create a new one`,
       );
     }
-    const id = config.id || generateId();
+    const id =
+      config.id !== undefined ? validateSessionId(config.id) : generateId();
     const zellijSessionName = `vibe-${id.substring(0, 8)}`;
     const now = nowISO();
 
@@ -719,31 +767,19 @@ class ZellijSessionProvider implements SessionProvider {
 
     // Spawn zellij session headlessly using `script` to provide a PTY.
     // Zellij requires a PTY to start; `script` provides one in headless mode.
+    // Invoked directly via argv array with stdio ignored — never via `sh -c`.
     try {
       const zellijCmd = await ensureZellijBinary(this.log);
-      if (isWindows()) {
-        // On Windows, spawn zellij directly (no script command)
-        Bun.spawn([zellijCmd, "-s", zellijSessionName], {
-          stdin: "ignore",
-          stdout: "ignore",
-          stderr: "ignore",
-        });
-      } else {
-        // Use sh -c to redirect stdin from /dev/null. The `script` command
-        // needs a PTY but stdin must come from /dev/null for headless mode.
-        Bun.spawn(
-          [
-            "sh",
-            "-c",
-            `script -qfc "${zellijCmd} -s ${zellijSessionName}" /dev/null </dev/null >/dev/null 2>&1`,
-          ],
-          {
-            stdin: "ignore",
-            stdout: "ignore",
-            stderr: "ignore",
-          },
-        );
-      }
+      const spawnArgs = buildZellijSpawnArgs(
+        zellijCmd,
+        zellijSessionName,
+        process.platform,
+      );
+      Bun.spawn(spawnArgs, {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+      });
     } catch (err) {
       this.log.error("Failed to spawn zellij session", {
         id,
